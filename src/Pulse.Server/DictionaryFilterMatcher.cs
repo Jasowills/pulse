@@ -53,7 +53,7 @@ public sealed class DictionaryFilterMatcher : IFilterMatcher
             CompareOp.Lte => present && values.Any(v => OrderingHolds(v, compare.Value, static c => c <= 0)),
             CompareOp.In => present && values.Any(v => AnyEqualAny(v, compare.Value)),
             CompareOp.NotIn => !present || !values.Any(v => AnyEqualAny(v, compare.Value)),
-            CompareOp.Exists => present,
+            CompareOp.Exists => present && values.Any(static v => v is not null),
             _ => throw new NotSupportedException($"Unsupported comparison operator '{compare.Op}'."),
         };
     }

@@ -141,6 +141,11 @@ public static class FilterValueHelpers
     /// <summary>Ordered comparison of two values, or null when the values aren't comparable.</summary>
     public static int? Compare(object? a, object? b)
     {
+        if (a is null || b is null)
+        {
+            return null;
+        }
+
         if (IsNumeric(a) && IsNumeric(b))
         {
             return CompareNumeric(a, b);

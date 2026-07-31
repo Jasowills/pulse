@@ -86,10 +86,14 @@ public sealed class DictionaryFilterMatcherTests
     }
 
     [Fact]
-    public void Exists_RequiresFieldPresence_NotNonNullValue()
+    public void Exists_RequiresPresentNonNullValue()
     {
-        Assert.True(Matcher.Matches(Doc(("status", (object?)null)), new SubscriptionFilter("orders", new FieldCompare("status", CompareOp.Exists, null))));
-        Assert.False(Matcher.Matches(Doc(), new SubscriptionFilter("orders", new FieldCompare("status", CompareOp.Exists, null))));
+        Assert.True(Matcher.Matches(Doc(("status", "pending")),
+            new SubscriptionFilter("orders", new FieldCompare("status", CompareOp.Exists, null))));
+        Assert.False(Matcher.Matches(Doc(("status", (object?)null)),
+            new SubscriptionFilter("orders", new FieldCompare("status", CompareOp.Exists, null))));
+        Assert.False(Matcher.Matches(Doc(),
+            new SubscriptionFilter("orders", new FieldCompare("status", CompareOp.Exists, null))));
     }
 
     [Fact]
