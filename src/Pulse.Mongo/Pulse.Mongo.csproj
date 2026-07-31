@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Pulse.Abstractions\Pulse.Abstractions.csproj" />
+    <ProjectReference Include="..\Pulse.Server\Pulse.Server.csproj" />
   </ItemGroup>
 
   <ItemGroup>

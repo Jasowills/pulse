@@ -20,9 +20,11 @@
 
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="8.0.29" />
     <ProjectReference Include="..\..\src\Pulse.Abstractions\Pulse.Abstractions.csproj" />
     <ProjectReference Include="..\..\src\Pulse.Server\Pulse.Server.csproj" />
     <ProjectReference Include="..\..\src\Pulse.Client\Pulse.Client.csproj" />
+    <ProjectReference Include="..\Pulse.TestSupport\Pulse.TestSupport.csproj" />
   </ItemGroup>
 
 </Project>

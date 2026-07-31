@@ -6,7 +6,7 @@ Pulse is a .NET package suite that lets clients subscribe to a query (collection
 
 Target framework: **.NET 8** (LTS, MAUI-compatible) for all projects.
 
-> **Status: v0.1 MVP — in progress.** Steps 0–2 of the [build order](#build-status) are done: scaffold, `Pulse.Abstractions`, and `Pulse.Mongo`'s change-stream `WatchAsync` (verified end-to-end against a real Testcontainers Mongo replica set). API shapes below are the design contract and will land in that order.
+> **Status: v0.1 MVP — in progress.** Steps 0–3 of the [build order](#build-status) are done: scaffold, `Pulse.Abstractions`, `Pulse.Mongo`'s change-stream `WatchAsync` (verified end-to-end against a real Testcontainers Mongo replica set), and `Pulse.Server`'s `PulseHub` broadcast with shared per-source watches and `AddMongoSource`. API shapes below are the design contract and will land in that order.
 
 ---
 
@@ -238,7 +238,7 @@ The v0.1 implementation follows this order — each step is independently demoab
 | 0 | Scaffold solution, project graph, dependencies | Done |
 | 1 | `Pulse.Abstractions`: types + JSON converters + round-trip tests | Done |
 | 2 | `Pulse.Mongo`: `WatchAsync` against Testcontainers Mongo | Done |
-| 3 | `Pulse.Server`: minimal `PulseHub` broadcast (no filter/snapshot) | Pending |
+| 3 | `Pulse.Server`: minimal `PulseHub` broadcast (no filter/snapshot) | Done |
 | 4 | `DictionaryFilterMatcher` + filtered fan-out | Pending |
 | 5 | `GetSnapshotAsync` + `PulseSnapshot` on subscribe (gap-free) | Pending |
 | 6 | Resume-token persistence (`IResumeTokenStore`, in-memory + file-based) | Pending |
