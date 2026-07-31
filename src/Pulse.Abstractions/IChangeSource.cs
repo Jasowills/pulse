@@ -4,6 +4,12 @@ namespace Pulse.Abstractions;
 public interface IChangeSource
 {
     /// <summary>
+    /// Returns a stable, provider-qualified id for a logical source (e.g. <c>mongo:db.orders</c>).
+    /// Resume tokens carry the id of the source that issued them so tokens are never misinterpreted.
+    /// </summary>
+    string ProviderIdFor(string source);
+
+    /// <summary>
     /// Begin watching a logical source (collection/table). Invokes <paramref name="onChange"/>
     /// for every matching change event. Returns a disposable that stops watching when disposed.
     /// If <paramref name="resumeFrom"/> is provided and valid, watching resumes from that point;

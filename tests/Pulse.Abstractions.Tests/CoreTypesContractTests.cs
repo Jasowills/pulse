@@ -42,6 +42,8 @@ public class CoreTypesContractTests
 
     private sealed class FakeChangeSource : IChangeSource
     {
+        public string ProviderIdFor(string source) => $"mongo:test.{source}";
+
         public Task<IAsyncDisposable> WatchAsync(
             string source,
             Func<ChangeEvent, Task> onChange,
