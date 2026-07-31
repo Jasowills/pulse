@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Pulse.Abstractions\Pulse.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\Pulse.Server\Pulse.Server.csproj" />
+    <ProjectReference Include="..\..\src\Pulse.Mongo\Pulse.Mongo.csproj" />
+    <ProjectReference Include="..\..\src\Pulse.Client\Pulse.Client.csproj" />
+  </ItemGroup>
+
+</Project>
