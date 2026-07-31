@@ -10,4 +10,8 @@ public sealed class ResumeTokenInvalidException : Exception
     public ResumeTokenInvalidException(string message) : base(message)
     {
     }
+
+    public ResumeTokenInvalidException(string message, Exception innerException) : base(message, innerException)
+    {
+    }
 }
