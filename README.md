@@ -236,7 +236,7 @@ The v0.1 implementation follows this order — each step is independently demoab
 | # | Step | Status |
 |---|---|---|
 | 0 | Scaffold solution, project graph, dependencies | Done |
-| 1 | `Pulse.Abstractions`: types + JSON converters + round-trip tests | Pending |
+| 1 | `Pulse.Abstractions`: types + JSON converters + round-trip tests | Done |
 | 2 | `Pulse.Mongo`: `WatchAsync` against Testcontainers Mongo | Pending |
 | 3 | `Pulse.Server`: minimal `PulseHub` broadcast (no filter/snapshot) | Pending |
 | 4 | `DictionaryFilterMatcher` + filtered fan-out | Pending |

@@ -27,6 +27,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "samples", "samples", "{1958
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Pulse.Sample.Server", "samples\Pulse.Sample.Server\Pulse.Sample.Server.csproj", "{3A5DBE3F-9CDB-4310-9F5B-8A43AEEB69C3}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Pulse.Abstractions.Tests", "tests\Pulse.Abstractions.Tests\Pulse.Abstractions.Tests.csproj", "{A44AC3FA-C1C6-4D12-95FB-A96462F2F9CF}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -72,6 +74,10 @@ Global
 		{3A5DBE3F-9CDB-4310-9F5B-8A43AEEB69C3}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{3A5DBE3F-9CDB-4310-9F5B-8A43AEEB69C3}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{3A5DBE3F-9CDB-4310-9F5B-8A43AEEB69C3}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A44AC3FA-C1C6-4D12-95FB-A96462F2F9CF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A44AC3FA-C1C6-4D12-95FB-A96462F2F9CF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A44AC3FA-C1C6-4D12-95FB-A96462F2F9CF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A44AC3FA-C1C6-4D12-95FB-A96462F2F9CF}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{1C47E09F-3533-4293-BBBF-CDA0A7818AA4} = {E9B83092-E222-4805-A530-175DF3B48658}
@@ -83,5 +89,6 @@ Global
 		{4C33830E-2AD2-483E-BB70-97F00BF1BCC8} = {47FCD4A1-D913-48A3-878E-B47A3C4660BA}
 		{D1487E13-EF73-44D9-A001-8EC881C96A22} = {47FCD4A1-D913-48A3-878E-B47A3C4660BA}
 		{3A5DBE3F-9CDB-4310-9F5B-8A43AEEB69C3} = {195864F1-2379-4CA5-A41E-0EA29A368598}
+		{A44AC3FA-C1C6-4D12-95FB-A96462F2F9CF} = {47FCD4A1-D913-48A3-878E-B47A3C4660BA}
 	EndGlobalSection
 EndGlobal
