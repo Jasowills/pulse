@@ -176,6 +176,62 @@ public sealed class PulseHubTests
         Assert.Equal(0, server.ChangeSource.ActiveWatchCount("orders"));
     }
 
+    [Fact]
+    public async Task FilteredSubscription_DeliversOnlyMatchingChanges()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+        var whereJson = """{"field":"status","op":"eq","value":"pending"}""";
+        await client.InvokeAsync<string>("Subscribe", "orders", whereJson);
+
+        await server.ChangeSource.PublishAsync(InsertEvent("orders", "doc-1", ("status", "shipped")));
+        await AssertNoMessageAsync(received);
+
+        await server.ChangeSource.PublishAsync(InsertEvent("orders", "doc-2", ("status", "pending")));
+
+        var msg = await ReadMessageAsync(received);
+        Assert.Equal("doc-2", msg.DocumentId);
+    }
+
+    [Fact]
+    public async Task FilteredSubscription_AlwaysReceivesDeletes()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+        await client.InvokeAsync<string>("Subscribe", "orders",
+            """{"field":"status","op":"eq","value":"pending"}""");
+
+        await server.ChangeSource.PublishAsync(InsertEvent("orders", "doc-1", ("status", "pending"))
+            with { Kind = ChangeKind.Delete, FullDocument = null });
+
+        var msg = await ReadMessageAsync(received);
+        Assert.Equal(ChangeKind.Delete, msg.Kind);
+        Assert.Equal("doc-1", msg.DocumentId);
+    }
+
+    [Fact]
+    public async Task FilteredSubscription_UsesNestedFilter()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+        await client.InvokeAsync<string>("Subscribe", "orders",
+            """{"and":[{"field":"customer.address.city","op":"eq","value":"berlin"},{"field":"total","op":"gte","value":100}]}""");
+
+        await server.ChangeSource.PublishAsync(InsertEvent("orders", "doc-1",
+            ("customer", new Dictionary<string, object?> { ["address"] = new Dictionary<string, object?> { ["city"] = "berlin" } }),
+            ("total", 100)));
+        var msg = await ReadMessageAsync(received);
+        Assert.Equal("doc-1", msg.DocumentId);
+
+        await server.ChangeSource.PublishAsync(InsertEvent("orders", "doc-2",
+            ("customer", new Dictionary<string, object?> { ["address"] = new Dictionary<string, object?> { ["city"] = "paris" } }),
+            ("total", 500)));
+        await AssertNoMessageAsync(received);
+    }
+
     private static async Task<HubConnection> ConnectAsync(string baseUrl)
     {
         var connection = new HubConnectionBuilder()

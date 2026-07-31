@@ -16,6 +16,7 @@ public class SubscriptionRegistry
 
     private readonly IChangeSource _changeSource;
     private readonly IHubContext<PulseHub> _hubContext;
+    private readonly IFilterMatcher _matcher;
     private readonly ILogger<SubscriptionRegistry> _logger;
     private readonly object _sync = new();
     private readonly Dictionary<string, SourceState> _sources = new(StringComparer.Ordinal);
@@ -24,10 +25,12 @@ public class SubscriptionRegistry
     public SubscriptionRegistry(
         IChangeSource changeSource,
         IHubContext<PulseHub> hubContext,
-        ILogger<SubscriptionRegistry> logger)
+        ILogger<SubscriptionRegistry> logger,
+        IFilterMatcher? matcher = null)
     {
         _changeSource = changeSource ?? throw new ArgumentNullException(nameof(changeSource));
         _hubContext = hubContext ?? throw new ArgumentNullException(nameof(hubContext));
+        _matcher = matcher ?? DictionaryFilterMatcher.Instance;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -171,6 +174,11 @@ public class SubscriptionRegistry
 
         foreach (var subscription in subscriptions)
         {
+            if (!ShouldDeliver(change, subscription))
+            {
+                continue;
+            }
+
             try
             {
                 await _hubContext.Clients.Client(subscription.ConnectionId)
@@ -184,6 +192,21 @@ public class SubscriptionRegistry
                     source, subscription.ConnectionId);
             }
         }
+    }
+
+    /// <summary>
+    /// Applies the subscription's filter to document changes. Deletes are always delivered
+    /// (their FullDocument is null, so they can't be evaluated — clients need the removal
+    /// either way); changes with no document body are delivered rather than silently dropped.
+    /// </summary>
+    private bool ShouldDeliver(ChangeEvent change, Subscription subscription)
+    {
+        if (subscription.Where is null || change.Kind == ChangeKind.Delete || change.FullDocument is null)
+        {
+            return true;
+        }
+
+        return _matcher.Matches(change.FullDocument, new SubscriptionFilter(change.Source, subscription.Where));
     }
 
     private sealed record Subscription(string Id, string ConnectionId, FilterExpr? Where);

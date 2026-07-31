@@ -78,7 +78,12 @@ public sealed record Or(IReadOnlyList<FilterExpr> Clauses) : FilterExpr
 [System.Text.Json.Serialization.JsonConverter(typeof(Pulse.Abstractions.Json.FilterExprJsonConverterFactory))]
 public sealed record Not(FilterExpr Clause) : FilterExpr;
 
-internal static class FilterValueHelpers
+/// <summary>
+/// Value comparison helpers implementing Pulse's explicit coercion semantics: numeric
+/// values compare numerically across CLR numeric types, strings compare by value, lists
+/// compare structurally. Used by filter expression equality and by filter matchers.
+/// </summary>
+public static class FilterValueHelpers
 {
     public static bool Equal(object? a, object? b)
     {
@@ -95,6 +100,14 @@ internal static class FilterValueHelpers
         if (a is string || b is string)
         {
             return a.Equals(b);
+        }
+
+        // Numeric coercion: a BSON int field vs a JSON long filter value (etc.) must compare
+        // numerically, not by runtime type — the spec calls this out as the #1 source of
+        // "filter silently doesn't match" bugs (see README).
+        if (IsNumeric(a) && IsNumeric(b))
+        {
+            return CompareNumeric(a, b) == 0;
         }
 
         if (a is IEnumerable ea && b is IEnumerable eb)
@@ -123,6 +136,53 @@ internal static class FilterValueHelpers
         }
 
         return a.Equals(b);
+    }
+
+    /// <summary>Ordered comparison of two values, or null when the values aren't comparable.</summary>
+    public static int? Compare(object? a, object? b)
+    {
+        if (IsNumeric(a) && IsNumeric(b))
+        {
+            return CompareNumeric(a, b);
+        }
+
+        if (a is string sa && b is string sb)
+        {
+            return string.CompareOrdinal(sa, sb);
+        }
+
+        if (a is DateTimeOffset dtoA && b is DateTimeOffset dtoB)
+        {
+            return dtoA.CompareTo(dtoB);
+        }
+
+        if (a is DateTime dtA && b is DateTime dtB)
+        {
+            return dtA.CompareTo(dtB);
+        }
+
+        if (a is IComparable comparable && a.GetType() == b?.GetType())
+        {
+            return comparable.CompareTo(b);
+        }
+
+        return null;
+    }
+
+    public static bool IsNumeric(object value)
+        => value is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal;
+
+    private static int CompareNumeric(object a, object b)
+    {
+        try
+        {
+            return Convert.ToDecimal(a, System.Globalization.CultureInfo.InvariantCulture)
+                .CompareTo(Convert.ToDecimal(b, System.Globalization.CultureInfo.InvariantCulture));
+        }
+        catch (Exception)
+        {
+            return -1; // NaN/Infinity and similar: treat as less-than so ordering stays total.
+        }
     }
 
     public static int Hash(object? value)
