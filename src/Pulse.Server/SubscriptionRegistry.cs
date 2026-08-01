@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 using Pulse.Abstractions;
@@ -60,6 +61,7 @@ public class SubscriptionRegistry
         string subscriptionId;
         SourceState state;
         Task startTask;
+        Subscription subscription;
         lock (_sync)
         {
             subscriptionId = $"sub-{Interlocked.Increment(ref _nextSubscriptionId)}";
@@ -69,7 +71,12 @@ public class SubscriptionRegistry
                 _sources[source] = state;
             }
 
-            state.Subscriptions[subscriptionId] = new Subscription(subscriptionId, connectionId, where);
+            subscription = new Subscription(
+                subscriptionId,
+                connectionId,
+                where,
+                Channel.CreateUnbounded<QueuedChange>());
+            state.Subscriptions[subscriptionId] = subscription;
             _subscriptions[subscriptionId] = (source, state);
             startTask = state.EnsureStartedAsync(_changeSource, FanOutAsync);
         }
@@ -80,19 +87,49 @@ public class SubscriptionRegistry
         }
         catch
         {
-            SourceState? toDispose;
-            lock (_sync)
-            {
-                toDispose = RemoveSubscriptionLocked(subscriptionId);
-            }
-
-            if (toDispose is not null)
-            {
-                await toDispose.DisposeAsync().ConfigureAwait(false);
-            }
-
+            await RemoveAndDisposeAsync(subscriptionId).ConfigureAwait(false);
             throw;
         }
+
+        // Cut point for gapless delivery: every change emitted by the watch before the
+        // snapshot query was requested is included in the snapshot, so it is dropped;
+        // everything after is replayed after the snapshot and supersedes it.
+        long cut;
+        lock (_sync)
+        {
+            cut = state.EmittedCount;
+        }
+
+        (IReadOnlyList<IReadOnlyDictionary<string, object?>> Documents, ResumeToken AsOf) snapshot;
+        try
+        {
+            snapshot = await _changeSource
+                .GetSnapshotAsync(source, new SubscriptionFilter(source, where), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            await RemoveAndDisposeAsync(subscriptionId).ConfigureAwait(false);
+            throw;
+        }
+
+        try
+        {
+            await _hubContext.Clients.Client(connectionId)
+                .SendAsync(
+                    "PulseSnapshot",
+                    new PulseSnapshotMessage(subscriptionId, snapshot.Documents),
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            await RemoveAndDisposeAsync(subscriptionId).ConfigureAwait(false);
+            throw;
+        }
+
+        // Drain from the channel in order; the writer is completed on unsubscribe/dispose.
+        _ = Task.Run(() => DeliverLoopAsync(subscription, cut));
 
         return subscriptionId;
     }
@@ -147,7 +184,8 @@ public class SubscriptionRegistry
         }
 
         _subscriptions.Remove(subscriptionId);
-        entry.State.Subscriptions.Remove(subscriptionId);
+        entry.State.Subscriptions.Remove(subscriptionId, out var removed);
+        removed?.Queue.Writer.TryComplete();
         if (entry.State.Subscriptions.Count == 0
             && _sources.TryGetValue(entry.Source, out var current)
             && ReferenceEquals(current, entry.State))
@@ -159,16 +197,33 @@ public class SubscriptionRegistry
         return null;
     }
 
-    private async Task FanOutAsync(string source, ChangeEvent change)
+    /// <summary>Removes a subscription and disposes its source watch when it was the last one.</summary>
+    private async Task RemoveAndDisposeAsync(string subscriptionId)
+    {
+        SourceState? toDispose;
+        lock (_sync)
+        {
+            toDispose = RemoveSubscriptionLocked(subscriptionId);
+        }
+
+        if (toDispose is not null)
+        {
+            await toDispose.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private Task FanOutAsync(string source, ChangeEvent change)
     {
         Subscription[] subscriptions;
+        long sequence;
         lock (_sync)
         {
             if (!_sources.TryGetValue(source, out var state))
             {
-                return;
+                return Task.CompletedTask;
             }
 
+            sequence = ++state.EmittedCount;
             subscriptions = state.Subscriptions.Values.ToArray();
         }
 
@@ -179,18 +234,54 @@ public class SubscriptionRegistry
                 continue;
             }
 
-            try
+            if (!subscription.Queue.Writer.TryWrite(new QueuedChange(sequence, change)))
             {
-                await _hubContext.Clients.Client(subscription.ConnectionId)
-                    .SendAsync("PulseChange", PulseChangeMessage.FromChangeEvent(change, subscription.Id), CancellationToken.None)
-                    .ConfigureAwait(false);
+                _logger.LogWarning(
+                    "Failed to enqueue change for source '{Source}' to subscription '{SubscriptionId}'.",
+                    source, subscription.Id);
             }
-            catch (Exception ex)
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sends queued changes in order, dropping everything at or before the subscription's
+    /// snapshot cut point (those changes are already reflected in the snapshot).
+    /// </summary>
+    private async Task DeliverLoopAsync(Subscription subscription, long cut)
+    {
+        try
+        {
+            await foreach (var queued in subscription.Queue.Reader.ReadAllAsync().ConfigureAwait(false))
             {
-                _logger.LogError(ex,
-                    "Failed to deliver change for source '{Source}' to connection '{ConnectionId}'.",
-                    source, subscription.ConnectionId);
+                if (queued.Sequence <= cut)
+                {
+                    continue;
+                }
+
+                await DeliverChangeAsync(subscription, queued.Change).ConfigureAwait(false);
             }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Delivery loop for subscription '{SubscriptionId}' failed.", subscription.Id);
+        }
+    }
+
+    private async Task DeliverChangeAsync(Subscription subscription, ChangeEvent change)
+    {
+        try
+        {
+            await _hubContext.Clients.Client(subscription.ConnectionId)
+                .SendAsync("PulseChange", PulseChangeMessage.FromChangeEvent(change, subscription.Id), CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Failed to deliver change for source '{Source}' to connection '{ConnectionId}'.",
+                change.Source, subscription.ConnectionId);
         }
     }
 
@@ -209,12 +300,21 @@ public class SubscriptionRegistry
         return _matcher.Matches(change.FullDocument, new SubscriptionFilter(change.Source, subscription.Where));
     }
 
-    private sealed record Subscription(string Id, string ConnectionId, FilterExpr? Where);
+    private readonly record struct QueuedChange(long Sequence, ChangeEvent Change);
+
+    private sealed record Subscription(
+        string Id,
+        string ConnectionId,
+        FilterExpr? Where,
+        Channel<QueuedChange> Queue);
 
     private sealed class SourceState
     {
         public readonly string Source;
         public readonly Dictionary<string, Subscription> Subscriptions = new(StringComparer.Ordinal);
+
+        /// <summary>Number of changes the watch has emitted for this source (guarded by the registry lock).</summary>
+        public long EmittedCount;
 
         private readonly object _sync = new();
         private CancellationTokenSource? _cts;

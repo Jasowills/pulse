@@ -232,6 +232,97 @@ public sealed class PulseHubTests
         await AssertNoMessageAsync(received);
     }
 
+    [Fact]
+    public async Task Subscribe_DeliversSnapshotBeforeChanges()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAllAsync(client);
+        var snapshotDocs = new IReadOnlyDictionary<string, object?>[]
+        {
+            new Dictionary<string, object?> { ["_id"] = "a", ["status"] = "pending" },
+            new Dictionary<string, object?> { ["_id"] = "b", ["status"] = "pending" },
+        };
+        server.ChangeSource.SnapshotProvider = (source, filter, ct) => Task.FromResult(
+            ((IReadOnlyList<IReadOnlyDictionary<string, object?>>)snapshotDocs, new ResumeToken("fake:orders", Array.Empty<byte>())));
+
+        await client.InvokeAsync<string>("Subscribe", "orders", null);
+        await server.ChangeSource.PublishAsync(InsertEvent("orders", "c", ("status", "pending")));
+
+        var first = await ReadMessageAsync(received);
+        var snapshot = Assert.IsType<PulseSnapshotMessage>(first);
+        Assert.Equal(2, snapshot.Documents.Count);
+        Assert.Equal("a", snapshot.Documents[0]["_id"]);
+
+        var second = await ReadMessageAsync(received);
+        var change = Assert.IsType<PulseChangeMessage>(second);
+        Assert.Equal("c", change.DocumentId);
+    }
+
+    [Fact]
+    public async Task Subscribe_PassesWhereFilterToSnapshot()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+
+        await client.InvokeAsync<string>("Subscribe", "orders",
+            """{"field":"status","op":"eq","value":"pending"}""");
+
+        Assert.NotNull(server.ChangeSource.LastSnapshotFilter);
+        Assert.Equal("orders", server.ChangeSource.LastSnapshotFilter!.Source);
+        var compare = Assert.IsType<FieldCompare>(server.ChangeSource.LastSnapshotFilter.Where);
+        Assert.Equal("status", compare.Field);
+        Assert.Equal(CompareOp.Eq, compare.Op);
+        Assert.Equal("pending", compare.Value);
+        Assert.Equal(1, server.ChangeSource.SnapshotCallCount);
+    }
+
+    [Fact]
+    public async Task ChangeArrivingDuringSnapshot_DeliveredAfterSnapshot()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAllAsync(client);
+        server.ChangeSource.SnapshotProvider = async (source, filter, ct) =>
+        {
+            await Task.Delay(150, ct);
+            return (Array.Empty<IReadOnlyDictionary<string, object?>>(), new ResumeToken("fake:orders", Array.Empty<byte>()));
+        };
+
+        var subscribeTask = client.InvokeAsync<string>("Subscribe", "orders", null);
+        await WaitUntilAsync(() => server.ChangeSource.ActiveWatchCount("orders") == 1);
+        await server.ChangeSource.PublishAsync(InsertEvent("orders", "c", ("status", "pending")));
+        await subscribeTask;
+
+        var first = await ReadMessageAsync(received);
+        Assert.IsType<PulseSnapshotMessage>(first);
+
+        var second = await ReadMessageAsync(received);
+        var change = Assert.IsType<PulseChangeMessage>(second);
+        Assert.Equal("c", change.DocumentId);
+    }
+
+    [Fact]
+    public async Task SnapshotProviderFailure_ThrowsHubException_AndCleansUp()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        server.ChangeSource.SnapshotProvider = (source, filter, ct)
+            => throw new InvalidOperationException("snapshot boom");
+
+        await Assert.ThrowsAsync<HubException>(
+            () => client.InvokeAsync<string>("Subscribe", "orders", null));
+        Assert.Equal(0, server.ChangeSource.ActiveWatchCount("orders"));
+    }
+
+    private static Channel<object> SubscribeAllAsync(HubConnection connection)
+    {
+        var channel = Channel.CreateUnbounded<object>();
+        connection.On<PulseChangeMessage>("PulseChange", message => channel.Writer.WriteAsync(message).AsTask());
+        connection.On<PulseSnapshotMessage>("PulseSnapshot", message => channel.Writer.WriteAsync(message).AsTask());
+        return channel;
+    }
+
     private static async Task<HubConnection> ConnectAsync(string baseUrl)
     {
         var connection = new HubConnectionBuilder()

@@ -15,6 +15,19 @@ public sealed class FakeChangeSource : IChangeSource
     /// <summary>When set, <see cref="WatchAsync"/> throws this exception (simulates provider failure at start).</summary>
     public Exception? StartException { get; set; }
 
+    /// <summary>
+    /// When set, <see cref="GetSnapshotAsync"/> delegates to this delegate; otherwise it
+    /// returns an empty document set. Tests use this to control snapshot contents and delay.
+    /// </summary>
+    public Func<string, SubscriptionFilter, CancellationToken, Task<(IReadOnlyList<IReadOnlyDictionary<string, object?>> Documents, ResumeToken AsOf)>>?
+        SnapshotProvider { get; set; }
+
+    /// <summary>Number of <see cref="GetSnapshotAsync"/> calls so far.</summary>
+    public int SnapshotCallCount { get; private set; }
+
+    /// <summary>The filter of the most recent <see cref="GetSnapshotAsync"/> call.</summary>
+    public SubscriptionFilter? LastSnapshotFilter { get; private set; }
+
     public string ProviderIdFor(string source) => $"fake:{source}";
 
     public Task<IAsyncDisposable> WatchAsync(
@@ -47,9 +60,20 @@ public sealed class FakeChangeSource : IChangeSource
         return Task.FromResult<IAsyncDisposable>(new FakeWatchHandle(this, source, onChange));
     }
 
-    public Task<(IReadOnlyList<IReadOnlyDictionary<string, object?>> Documents, ResumeToken AsOf)>
+    public async Task<(IReadOnlyList<IReadOnlyDictionary<string, object?>> Documents, ResumeToken AsOf)>
         GetSnapshotAsync(string source, SubscriptionFilter filter, CancellationToken cancellationToken)
-        => throw new NotSupportedException("GetSnapshotAsync is not implemented yet (Pulse build step 5).");
+    {
+        SnapshotCallCount++;
+        LastSnapshotFilter = filter;
+        if (SnapshotProvider is not null)
+        {
+            return await SnapshotProvider(source, filter, cancellationToken).ConfigureAwait(false);
+        }
+
+        return (
+            Array.Empty<IReadOnlyDictionary<string, object?>>(),
+            new ResumeToken(ProviderIdFor(source), Array.Empty<byte>()));
+    }
 
     /// <summary>Delivers a change to every active watch on <paramref name="change"/>.Source.</summary>
     public Task PublishAsync(ChangeEvent change)

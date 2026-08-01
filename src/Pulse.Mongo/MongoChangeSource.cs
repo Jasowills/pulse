@@ -66,10 +66,93 @@ public sealed class MongoChangeSource : IChangeSource
         return await RegisterSharedAsync(source, onChange, cancellationToken).ConfigureAwait(false);
     }
 
-    public Task<(IReadOnlyList<IReadOnlyDictionary<string, object?>> Documents, ResumeToken AsOf)>
+    public async Task<(IReadOnlyList<IReadOnlyDictionary<string, object?>> Documents, ResumeToken AsOf)>
         GetSnapshotAsync(string source, SubscriptionFilter filter, CancellationToken cancellationToken)
-        => throw new NotSupportedException(
-            "GetSnapshotAsync is not implemented yet (Pulse build step 5).");
+    {
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            throw new ArgumentException("Source must be a non-empty collection name.", nameof(source));
+        }
+
+        if (filter is null)
+        {
+            throw new ArgumentNullException(nameof(filter));
+        }
+
+        if (filter.Where is not null && !string.Equals(filter.Source, source, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"Filter was built for source '{filter.Source}' but the snapshot targets '{source}'.",
+                nameof(filter));
+        }
+
+        var collection = _database.GetCollection<BsonDocument>(source);
+
+        // Watch-first, then snapshot (see README "Resume tokens and gapless delivery"): the
+        // as-of token is captured before the snapshot query runs, so changes at or after it
+        // supersede the snapshot and the caller can deliver without a gap or duplicate.
+        var asOf = await CaptureAsOfTokenAsync(collection, source, cancellationToken).ConfigureAwait(false);
+
+        var where = filter.Where is null
+            ? Builders<BsonDocument>.Filter.Empty
+            : MongoFilterTranslator.Translate(filter.Where);
+
+        var documents = new List<IReadOnlyDictionary<string, object?>>();
+        using var cursor = await collection
+            .FindAsync(where, cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+        while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+        {
+            foreach (var document in cursor.Current)
+            {
+                documents.Add(BsonValueConverter.ToDictionary(document));
+            }
+        }
+
+        return (documents, new ResumeToken(ProviderIdFor(source), asOf));
+    }
+
+    /// <summary>
+    /// Captures the change stream's current resume token without consuming events: the
+    /// initial <see cref="IMongoCollection{TDocument}.WatchAsync"/> response carries the
+    /// cursor's start position, exposed via <see cref="IChangeStreamCursor{TDocument}.GetResumeToken"/>.
+    /// </summary>
+    private async Task<byte[]> CaptureAsOfTokenAsync(
+        IMongoCollection<BsonDocument> collection,
+        string source,
+        CancellationToken cancellationToken)
+    {
+        using var cursor = await collection.WatchAsync(Pipeline, cancellationToken: cancellationToken).ConfigureAwait(false);
+        while (true)
+        {
+            if (TryGetResumeToken(cursor) is { } token)
+            {
+                return MongoResumeTokenCodec.Encode(token);
+            }
+
+            if (!await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+            {
+                break;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Change stream for '{ProviderIdFor(source)}' closed without yielding a resume token.");
+    }
+
+    /// <summary>Returns the cursor's resume token, or null when the initial response has not arrived yet.</summary>
+    private static BsonDocument? TryGetResumeToken(
+        IChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor)
+    {
+        try
+        {
+            return cursor.GetResumeToken();
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
 
     private void ValidateProviderId(string source, ResumeToken resumeFrom)
     {

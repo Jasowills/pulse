@@ -210,10 +210,97 @@ public sealed class MongoChangeSourceTests : IClassFixture<MongoContainerFixture
     }
 
     [Fact]
-    public async Task GetSnapshotAsync_IsNotImplementedYet()
+    public async Task GetSnapshotAsync_ReturnsMatchingDocuments_WithAsOfToken()
     {
-        await Assert.ThrowsAsync<NotSupportedException>(
-            () => _source.GetSnapshotAsync("orders", new SubscriptionFilter("orders", null), CancellationToken.None));
+        await _orders.InsertOneAsync(new BsonDocument
+        {
+            { "_id", "a" }, { "status", "pending" }, { "total", 50 },
+        });
+        await _orders.InsertOneAsync(new BsonDocument
+        {
+            { "_id", "b" }, { "status", "shipped" }, { "total", 200 },
+        });
+        await _orders.InsertOneAsync(new BsonDocument
+        {
+            { "_id", "c" }, { "status", "pending" }, { "total", 150 },
+        });
+
+        var (documents, asOf) = await _source.GetSnapshotAsync(
+            "orders",
+            new SubscriptionFilter("orders", new FieldCompare("status", CompareOp.Eq, "pending")),
+            CancellationToken.None);
+
+        Assert.Equal(2, documents.Count);
+        Assert.Contains(documents, d => (string)d["_id"]! == "a");
+        Assert.Contains(documents, d => (string)d["_id"]! == "c");
+        Assert.All(documents, d => Assert.Equal("pending", d["status"]));
+        Assert.Equal($"mongo:{_db}.orders", asOf.ProviderId);
+        Assert.NotEmpty(asOf.Opaque);
+    }
+
+    [Fact]
+    public async Task GetSnapshotAsync_NoFilter_ReturnsAllDocuments()
+    {
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "a" } });
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "b" } });
+
+        var (documents, _) = await _source.GetSnapshotAsync(
+            "orders",
+            new SubscriptionFilter("orders", null),
+            CancellationToken.None);
+
+        Assert.Equal(2, documents.Count);
+    }
+
+    [Fact]
+    public async Task GetSnapshotAsync_SupportsNestedAndArithmeticFilters()
+    {
+        await _orders.InsertOneAsync(new BsonDocument
+        {
+            { "_id", "a" },
+            { "customer", new BsonDocument { { "address", new BsonDocument { { "city", "berlin" } } } } },
+            { "total", 150 },
+        });
+        await _orders.InsertOneAsync(new BsonDocument
+        {
+            { "_id", "b" },
+            { "customer", new BsonDocument { { "address", new BsonDocument { { "city", "paris" } } } } },
+            { "total", 500 },
+        });
+
+        var where = new And(new FilterExpr[]
+        {
+            new FieldCompare("customer.address.city", CompareOp.Eq, "berlin"),
+            new FieldCompare("total", CompareOp.Gte, 100),
+        });
+
+        var (documents, _) = await _source.GetSnapshotAsync(
+            "orders",
+            new SubscriptionFilter("orders", where),
+            CancellationToken.None);
+
+        var doc = Assert.Single(documents);
+        Assert.Equal("a", doc["_id"]);
+    }
+
+    [Fact]
+    public async Task GetSnapshotAsync_AsOfToken_ResumesWithNoReplayOrGap()
+    {
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "a" } });
+
+        var (_, asOf) = await _source.GetSnapshotAsync(
+            "orders",
+            new SubscriptionFilter("orders", null),
+            CancellationToken.None);
+
+        // The as-of token must resume the change stream right after the snapshot point:
+        // a change made before the snapshot must NOT arrive, a change after it must.
+        await using var sub = await SubscribeAsync(_source, "orders", asOf);
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "b" } });
+
+        var e = await WaitForAsync(sub);
+        Assert.Equal("b", e.DocumentId);
+        await AssertNoEventAsync(sub, TimeSpan.FromSeconds(1));
     }
 
     private async Task<Subscription> SubscribeAsync(
