@@ -315,6 +315,54 @@ public sealed class PulseHubTests
         Assert.Equal(0, server.ChangeSource.ActiveWatchCount("orders"));
     }
 
+    [Fact]
+    public async Task StoredResumeToken_IsPassedToWatchOnSubscribe()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var stored = new ResumeToken("fake:orders", new byte[] { 1, 2, 3 });
+        await server.ResumeTokenStore.SaveAsync("fake:orders", stored, CancellationToken.None);
+
+        await client.InvokeAsync<string>("Subscribe", "orders", null);
+
+        var token = Assert.Single(server.ChangeSource.ResumeTokensSeen);
+        Assert.Equal(stored, token);
+    }
+
+    [Fact]
+    public async Task InvalidStoredToken_FallsBackToFreshWatch_AndDeletesToken()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var stale = new ResumeToken("fake:orders", new byte[] { 9 });
+        await server.ResumeTokenStore.SaveAsync("fake:orders", stale, CancellationToken.None);
+        server.ChangeSource.ResumeRejectionException = new ResumeTokenInvalidException("stale token", null);
+
+        await client.InvokeAsync<string>("Subscribe", "orders", null);
+
+        Assert.Equal(2, server.ChangeSource.WatchCallCount);
+        Assert.Equal(stale, server.ChangeSource.ResumeTokensSeen[0]);
+        Assert.Null(server.ChangeSource.ResumeTokensSeen[1]);
+        Assert.Null(await server.ResumeTokenStore.GetAsync("fake:orders", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Changes_PersistResumeTokenToStore()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+        await client.InvokeAsync<string>("Subscribe", "orders", null);
+        var token = new ResumeToken("fake:orders", new byte[] { 7 });
+
+        await server.ChangeSource.PublishAsync(InsertEvent("orders", "doc-1", ("status", "pending")) with { Token = token });
+
+        var stored = await server.ResumeTokenStore.GetAsync("fake:orders", CancellationToken.None);
+        Assert.Equal(token, stored);
+        var msg = await ReadMessageAsync(received);
+        Assert.Equal("doc-1", msg.DocumentId);
+    }
+
     private static Channel<object> SubscribeAllAsync(HubConnection connection)
     {
         var channel = Channel.CreateUnbounded<object>();

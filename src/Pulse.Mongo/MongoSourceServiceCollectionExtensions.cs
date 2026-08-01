@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
 using Pulse.Server;
@@ -39,6 +40,9 @@ public static class MongoSourceServiceCollectionExtensions
         }
 
         services.AddSignalR();
+        // Default resume store is in-memory (does not survive restarts — see README caveats).
+        // Register IResumeTokenStore yourself before AddMongoSource to override, e.g. FileResumeTokenStore.
+        services.TryAddSingleton<IResumeTokenStore, InMemoryResumeTokenStore>();
         services.AddSingleton(new MongoClient(MongoClientSettings.FromConnectionString(options.ConnectionString)));
         services.AddSingleton(sp => new MongoChangeSource(
             sp.GetRequiredService<IMongoClient>().GetDatabase(options.Database),
@@ -46,7 +50,8 @@ public static class MongoSourceServiceCollectionExtensions
         services.AddSingleton(sp => new SubscriptionRegistry(
             sp.GetRequiredService<MongoChangeSource>(),
             sp.GetRequiredService<IHubContext<PulseHub>>(),
-            sp.GetRequiredService<ILogger<SubscriptionRegistry>>()));
+            sp.GetRequiredService<ILogger<SubscriptionRegistry>>(),
+            sp.GetRequiredService<IResumeTokenStore>()));
         services.AddSingleton<IPulseAuthorizer, AllowAllAuthorizer>();
         return services;
     }

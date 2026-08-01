@@ -11,7 +11,7 @@ public sealed class ResumeTokenInvalidException : Exception
     {
     }
 
-    public ResumeTokenInvalidException(string message, Exception innerException) : base(message, innerException)
+    public ResumeTokenInvalidException(string message, Exception? innerException) : base(message, innerException)
     {
     }
 }

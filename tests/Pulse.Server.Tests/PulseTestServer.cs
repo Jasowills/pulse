@@ -18,14 +18,17 @@ public sealed class PulseTestServer : IAsyncDisposable
 {
     private readonly WebApplication _app;
 
-    private PulseTestServer(WebApplication app, FakeChangeSource changeSource)
+    private PulseTestServer(WebApplication app, FakeChangeSource changeSource, InMemoryResumeTokenStore resumeTokenStore)
     {
         _app = app;
         ChangeSource = changeSource;
+        ResumeTokenStore = resumeTokenStore;
         BaseUrl = app.Urls.First();
     }
 
     public FakeChangeSource ChangeSource { get; }
+
+    public InMemoryResumeTokenStore ResumeTokenStore { get; }
 
     public string BaseUrl { get; }
 
@@ -38,6 +41,7 @@ public sealed class PulseTestServer : IAsyncDisposable
         builder.Logging.ClearProviders();
 
         var changeSource = new FakeChangeSource();
+        var resumeTokenStore = new InMemoryResumeTokenStore();
         builder.Services.AddSignalR();
         builder.Services.AddSingleton<IChangeSource>(changeSource);
         if (registerDefaultRegistry)
@@ -45,7 +49,8 @@ public sealed class PulseTestServer : IAsyncDisposable
             builder.Services.AddSingleton(sp => new SubscriptionRegistry(
                 sp.GetRequiredService<IChangeSource>(),
                 sp.GetRequiredService<IHubContext<PulseHub>>(),
-                sp.GetRequiredService<ILogger<SubscriptionRegistry>>()));
+                sp.GetRequiredService<ILogger<SubscriptionRegistry>>(),
+                resumeTokenStore));
         }
 
         builder.Services.AddSingleton<IPulseAuthorizer, AllowAllAuthorizer>();
@@ -54,7 +59,7 @@ public sealed class PulseTestServer : IAsyncDisposable
         var app = builder.Build();
         app.MapHub<PulseHub>("/pulse");
         await app.StartAsync();
-        return new PulseTestServer(app, changeSource);
+        return new PulseTestServer(app, changeSource, resumeTokenStore);
     }
 
     public async ValueTask DisposeAsync()

@@ -145,7 +145,81 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
         await server.App.DisposeAsync();
     }
 
+    [Fact]
+    public async Task ServerRestart_ResumesFromPersistedToken_WithNoGap()
+    {
+        var resumeDir = Path.Combine(Path.GetTempPath(), "pulse_resume_it_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            await _orders.InsertOneAsync(new BsonDocument { { "_id", "a" }, { "status", "pending" } });
+            await _orders.InsertOneAsync(new BsonDocument { { "_id", "b" }, { "status", "pending" } });
+
+            // First server: subscribe, receive one change (c), then shut down.
+            var serverA = await StartServerAsync(_database, resumeDir);
+            var connA = await ConnectAsync(serverA.BaseUrl);
+            var receivedA = Channel.CreateUnbounded<object>();
+            connA.On<PulseChangeMessage>("PulseChange", message => receivedA.Writer.WriteAsync(message).AsTask());
+            connA.On<PulseSnapshotMessage>("PulseSnapshot", message => receivedA.Writer.WriteAsync(message).AsTask());
+            await connA.InvokeAsync<string>("Subscribe", "orders", null);
+            Assert.IsType<PulseSnapshotMessage>(await ReadMessageAsync(receivedA));
+
+            await _orders.InsertOneAsync(new BsonDocument { { "_id", "c" }, { "status", "pending" } });
+            Assert.Equal("c", Assert.IsType<PulseChangeMessage>(await ReadMessageAsync(receivedA)).DocumentId);
+            await connA.DisposeAsync();
+            await serverA.App.DisposeAsync();
+
+            // The resume point is persisted (asynchronously after delivery, so poll).
+            await WaitUntilAsync(() => Directory.GetFiles(resumeDir).Length == 1);
+
+            // A change lands while nothing is watching.
+            await _orders.InsertOneAsync(new BsonDocument { { "_id", "d" }, { "status", "pending" } });
+
+            // Second server with the same store: nothing is lost (d is in the snapshot)
+            // and nothing before the resume point (a/b/c) is replayed.
+            var serverB = await StartServerAsync(_database, resumeDir);
+            var connB = await ConnectAsync(serverB.BaseUrl);
+            var receivedB = Channel.CreateUnbounded<object>();
+            connB.On<PulseChangeMessage>("PulseChange", message => receivedB.Writer.WriteAsync(message).AsTask());
+            connB.On<PulseSnapshotMessage>("PulseSnapshot", message => receivedB.Writer.WriteAsync(message).AsTask());
+            await connB.InvokeAsync<string>("Subscribe", "orders", null);
+
+            var snapshot = Assert.IsType<PulseSnapshotMessage>(await ReadMessageAsync(receivedB));
+            Assert.Equal(4, snapshot.Documents.Count);
+            Assert.Contains(snapshot.Documents, doc => doc["_id"] is "d");
+
+            // The resumed watch may replay the change that happened while nothing was
+            // watching (a benign duplicate of the snapshot). If it does, it must be 'd' —
+            // never a pre-resume document.
+            if (await TryReadAsync(receivedB, TimeSpan.FromSeconds(2)) is PulseChangeMessage replay)
+            {
+                Assert.Equal("d", replay.DocumentId);
+            }
+
+            // Live flow still works after resume.
+            await _orders.InsertOneAsync(new BsonDocument { { "_id", "e" }, { "status", "pending" } });
+            var live = Assert.IsType<PulseChangeMessage>(await ReadMessageAsync(receivedB));
+            Assert.Equal("e", live.DocumentId);
+
+            await connB.DisposeAsync();
+            await serverB.App.DisposeAsync();
+        }
+        finally
+        {
+            if (Directory.Exists(resumeDir))
+            {
+                Directory.Delete(resumeDir, recursive: true);
+            }
+        }
+    }
+
     private static async Task<(WebApplication App, string BaseUrl)> StartServerAsync(IMongoDatabase database)
+    {
+        return await StartServerAsync(database, null);
+    }
+
+    private static async Task<(WebApplication App, string BaseUrl)> StartServerAsync(
+        IMongoDatabase database,
+        string? resumeTokenDirectory)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -153,10 +227,16 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
         builder.Services.AddSignalR();
         builder.Services.AddSingleton(database);
         builder.Services.AddSingleton<IChangeSource, MongoChangeSource>();
+        if (resumeTokenDirectory is not null)
+        {
+            builder.Services.AddSingleton<IResumeTokenStore>(new FileResumeTokenStore(resumeTokenDirectory));
+        }
+
         builder.Services.AddSingleton(sp => new SubscriptionRegistry(
             sp.GetRequiredService<IChangeSource>(),
             sp.GetRequiredService<IHubContext<PulseHub>>(),
-            sp.GetRequiredService<ILogger<SubscriptionRegistry>>()));
+            sp.GetRequiredService<ILogger<SubscriptionRegistry>>(),
+            sp.GetService<IResumeTokenStore>()));
         builder.Services.AddSingleton<IPulseAuthorizer, AllowAllAuthorizer>();
         var app = builder.Build();
         app.MapHub<PulseHub>("/pulse");
@@ -185,5 +265,32 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
         await Assert.ThrowsAsync<OperationCanceledException>(() => channel.Reader.ReadAsync(cts.Token).AsTask());
+    }
+
+    private static async Task<T?> TryReadAsync<T>(Channel<T> channel, TimeSpan timeout)
+    {
+        using var cts = new CancellationTokenSource(timeout);
+        try
+        {
+            return await channel.Reader.ReadAsync(cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return default;
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan? timeout = null)
+    {
+        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(5));
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail("Condition was not satisfied within the timeout.");
+            }
+
+            await Task.Delay(50);
+        }
     }
 }

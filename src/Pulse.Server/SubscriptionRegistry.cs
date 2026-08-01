@@ -18,6 +18,7 @@ public class SubscriptionRegistry
     private readonly IChangeSource _changeSource;
     private readonly IHubContext<PulseHub> _hubContext;
     private readonly IFilterMatcher _matcher;
+    private readonly IResumeTokenStore _resumeTokenStore;
     private readonly ILogger<SubscriptionRegistry> _logger;
     private readonly object _sync = new();
     private readonly Dictionary<string, SourceState> _sources = new(StringComparer.Ordinal);
@@ -27,11 +28,13 @@ public class SubscriptionRegistry
         IChangeSource changeSource,
         IHubContext<PulseHub> hubContext,
         ILogger<SubscriptionRegistry> logger,
+        IResumeTokenStore? resumeTokenStore = null,
         IFilterMatcher? matcher = null)
     {
         _changeSource = changeSource ?? throw new ArgumentNullException(nameof(changeSource));
         _hubContext = hubContext ?? throw new ArgumentNullException(nameof(hubContext));
         _matcher = matcher ?? DictionaryFilterMatcher.Instance;
+        _resumeTokenStore = resumeTokenStore ?? new InMemoryResumeTokenStore();
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -67,7 +70,7 @@ public class SubscriptionRegistry
             subscriptionId = $"sub-{Interlocked.Increment(ref _nextSubscriptionId)}";
             if (!_sources.TryGetValue(source, out state!))
             {
-                state = new SourceState(source);
+                state = new SourceState(source, _changeSource.ProviderIdFor(source), _resumeTokenStore, _logger);
                 _sources[source] = state;
             }
 
@@ -212,15 +215,16 @@ public class SubscriptionRegistry
         }
     }
 
-    private Task FanOutAsync(string source, ChangeEvent change)
+    private async Task FanOutAsync(string source, ChangeEvent change)
     {
         Subscription[] subscriptions;
+        SourceState state;
         long sequence;
         lock (_sync)
         {
-            if (!_sources.TryGetValue(source, out var state))
+            if (!_sources.TryGetValue(source, out state!))
             {
-                return Task.CompletedTask;
+                return;
             }
 
             sequence = ++state.EmittedCount;
@@ -242,7 +246,18 @@ public class SubscriptionRegistry
             }
         }
 
-        return Task.CompletedTask;
+        // Persist the resume point after delivery enqueue so a restart replays at most
+        // the events since the last save (at-least-once, never a silent gap).
+        try
+        {
+            await _resumeTokenStore
+                .SaveAsync(state.ResumeKey, change.Token, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to persist resume token for source '{Source}'.", source);
+        }
     }
 
     /// <summary>
@@ -311,20 +326,30 @@ public class SubscriptionRegistry
     private sealed class SourceState
     {
         public readonly string Source;
+        public readonly string ResumeKey;
         public readonly Dictionary<string, Subscription> Subscriptions = new(StringComparer.Ordinal);
 
         /// <summary>Number of changes the watch has emitted for this source (guarded by the registry lock).</summary>
         public long EmittedCount;
 
+        private readonly IResumeTokenStore _store;
+        private readonly ILogger<SubscriptionRegistry> _logger;
         private readonly object _sync = new();
         private CancellationTokenSource? _cts;
         private IAsyncDisposable? _handle;
         private Task? _startTask;
         private bool _disposed;
 
-        public SourceState(string source)
+        public SourceState(
+            string source,
+            string resumeKey,
+            IResumeTokenStore store,
+            ILogger<SubscriptionRegistry> logger)
         {
             Source = source;
+            ResumeKey = resumeKey;
+            _store = store;
+            _logger = logger;
         }
 
         /// <summary>Returns a task that completes when the underlying watch is open (or start failed).</summary>
@@ -349,9 +374,11 @@ public class SubscriptionRegistry
         {
             try
             {
-                var handle = await changeSource
-                    .WatchAsync(Source, change => onEvent(Source, change), null, cts.Token)
-                    .ConfigureAwait(false);
+                // Resume from the persisted point when one exists; if it turned stale/invalid,
+                // fall back to a fresh watch — the subscribe-time snapshot covers the gap
+                // (the token is logged and deleted, never silently ignored).
+                var resumeFrom = await _store.GetAsync(ResumeKey, cts.Token).ConfigureAwait(false);
+                var handle = await OpenWatchAsync(changeSource, onEvent, resumeFrom, cts).ConfigureAwait(false);
 
                 IAsyncDisposable? staleHandle = null;
                 lock (_sync)
@@ -379,6 +406,38 @@ public class SubscriptionRegistry
                 }
 
                 throw;
+            }
+        }
+
+        private async Task<IAsyncDisposable> OpenWatchAsync(
+            IChangeSource changeSource,
+            Func<string, ChangeEvent, Task> onEvent,
+            ResumeToken? resumeFrom,
+            CancellationTokenSource cts)
+        {
+            try
+            {
+                return await changeSource
+                    .WatchAsync(Source, change => onEvent(Source, change), resumeFrom, cts.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (ResumeTokenInvalidException ex) when (resumeFrom is not null)
+            {
+                _logger.LogWarning(ex,
+                    "Stored resume token for source '{Source}' is stale or invalid; resyncing from a fresh watch.",
+                    Source);
+                try
+                {
+                    await _store.DeleteAsync(ResumeKey, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception deleteEx)
+                {
+                    _logger.LogError(deleteEx, "Failed to delete invalid resume token for source '{Source}'.", Source);
+                }
+
+                return await changeSource
+                    .WatchAsync(Source, change => onEvent(Source, change), null, cts.Token)
+                    .ConfigureAwait(false);
             }
         }
 

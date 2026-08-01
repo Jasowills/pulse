@@ -15,6 +15,22 @@ public sealed class FakeChangeSource : IChangeSource
     /// <summary>When set, <see cref="WatchAsync"/> throws this exception (simulates provider failure at start).</summary>
     public Exception? StartException { get; set; }
 
+    /// <summary>When set, <see cref="WatchAsync"/> throws it when a resume token is supplied (simulates a stale token).</summary>
+    public Exception? ResumeRejectionException { get; set; }
+
+    /// <summary>Number of <see cref="WatchAsync"/> calls so far (resync retries increase this).</summary>
+    public int WatchCallCount { get; private set; }
+
+    /// <summary>Every resume token passed to <see cref="WatchAsync"/>, in call order (null entries = fresh watch).</summary>
+    public IReadOnlyList<ResumeToken?> ResumeTokensSeen { get; }
+
+    private readonly List<ResumeToken?> _resumeTokensSeen = new();
+
+    public FakeChangeSource()
+    {
+        ResumeTokensSeen = _resumeTokensSeen;
+    }
+
     /// <summary>
     /// When set, <see cref="GetSnapshotAsync"/> delegates to this delegate; otherwise it
     /// returns an empty document set. Tests use this to control snapshot contents and delay.
@@ -36,9 +52,15 @@ public sealed class FakeChangeSource : IChangeSource
         ResumeToken? resumeFrom,
         CancellationToken cancellationToken)
     {
-        if (resumeFrom is not null)
+        lock (_sync)
         {
-            throw new ResumeTokenInvalidException("FakeChangeSource does not support resume tokens.");
+            WatchCallCount++;
+            _resumeTokensSeen.Add(resumeFrom);
+        }
+
+        if (resumeFrom is not null && ResumeRejectionException is not null)
+        {
+            throw ResumeRejectionException;
         }
 
         if (StartException is not null)
