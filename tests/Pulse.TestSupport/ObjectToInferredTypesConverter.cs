@@ -19,7 +19,9 @@ public sealed class ObjectToInferredTypesConverter : JsonConverter<object>
             case JsonTokenType.False:
                 return false;
             case JsonTokenType.Number:
-                return reader.TryGetInt64(out var integral) ? integral : reader.GetDouble();
+                return reader.TryGetInt64(out var integral)
+                    ? integral
+                    : (object?)reader.GetDouble();
             case JsonTokenType.String:
                 return reader.GetString();
             case JsonTokenType.StartObject:
@@ -49,7 +51,9 @@ public sealed class ObjectToInferredTypesConverter : JsonConverter<object>
         {
             JsonValueKind.True => true,
             JsonValueKind.False => false,
-            JsonValueKind.Number => element.TryGetInt64(out var integral) ? integral : element.GetDouble(),
+            JsonValueKind.Number => element.TryGetInt64(out var integral)
+                ? integral
+                : (object?)element.GetDouble(),
             JsonValueKind.String => element.GetString(),
             JsonValueKind.Object => element.EnumerateObject()
                 .ToDictionary(p => p.Name, p => ReadElement(p.Value)),
