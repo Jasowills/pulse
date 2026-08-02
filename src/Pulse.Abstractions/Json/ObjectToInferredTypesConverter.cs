@@ -1,12 +1,13 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace Pulse.TestSupport;
+namespace Pulse.Abstractions.Json;
 
 /// <summary>
 /// Deserializes object-typed JSON values into concrete CLR types (long/double/string/bool,
-/// nested dictionaries/lists) instead of JsonElement, matching the shapes produced by
-/// <c>IChangeSource</c> implementations. Applied to the SignalR JSON protocol in tests.
+/// nested dictionaries/lists) instead of <see cref="JsonElement"/>, matching the shapes
+/// produced by <c>IChangeSource</c> implementations. Applied to the SignalR JSON protocol
+/// so both the server and the SDK deserialize document payloads identically.
 /// </summary>
 public sealed class ObjectToInferredTypesConverter : JsonConverter<object>
 {

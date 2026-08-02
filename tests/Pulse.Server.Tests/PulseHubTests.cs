@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Pulse.Abstractions;
+using Pulse.Abstractions.Json;
 using Pulse.Server;
 using Pulse.TestSupport;
 

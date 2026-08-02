@@ -8,6 +8,8 @@ using Microsoft.Extensions.Logging;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using Pulse.Abstractions;
+using Pulse.Abstractions.Json;
+using Pulse.Client;
 using Pulse.Mongo;
 using Pulse.Server;
 using Pulse.TestSupport;
@@ -212,6 +214,55 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
         }
     }
 
+    [Fact]
+    public async Task PulseClient_Subscribes_AndMaintainsCurrent()
+    {
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "a" }, { "status", "pending" }, { "total", 50 } });
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "b" }, { "status", "shipped" }, { "total", 200 } });
+
+        var server = await StartServerAsync(_database);
+        await using var client = new PulseClient(server.BaseUrl + "/pulse");
+        await client.ConnectAsync();
+
+        var snapshotTcs = new TaskCompletionSource<IReadOnlyList<Order>>();
+        var sub = await client.Subscribe<Order>("orders", new FieldCompare("status", CompareOp.Eq, "pending"));
+        sub.OnSnapshot += docs => snapshotTcs.TrySetResult(docs);
+
+        var snapshot = await snapshotTcs.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Single(snapshot);
+        Assert.Equal("a", snapshot[0]._id);
+        Assert.Equal("a", Assert.Single(sub.Current)._id);
+
+        // A matching insert arrives live and updates Current.
+        var changes = Channel.CreateUnbounded<PulseChange<Order>>();
+        sub.OnChange += change => changes.Writer.TryWrite(change);
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "c" }, { "status", "pending" }, { "total", 99 } });
+        var insert = await ReadMessageAsync(changes);
+        Assert.Equal(ChangeKind.Insert, insert.Kind);
+        Assert.Equal("c", insert.DocumentId);
+        Assert.Equal(99, insert.Document!.total);
+        Assert.Equal(2, sub.Current.Count);
+
+        // A matching update arrives with updated fields.
+        await _orders.UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", "c"),
+            Builders<BsonDocument>.Update.Set("total", 150));
+        var update = await ReadMessageAsync(changes);
+        Assert.Equal(ChangeKind.Update, update.Kind);
+        Assert.Equal(150L, update.UpdatedFields!["total"]);
+        Assert.Equal(150, sub.Current.Single(d => d._id == "c").total);
+
+        // A delete removes the document from Current.
+        await _orders.DeleteOneAsync(Builders<BsonDocument>.Filter.Eq("_id", "a"));
+        var delete = await ReadMessageAsync(changes);
+        Assert.Equal(ChangeKind.Delete, delete.Kind);
+        Assert.DoesNotContain(sub.Current, d => d._id == "a");
+
+        await sub.UnsubscribeAsync();
+        await client.DisposeAsync();
+        await server.App.DisposeAsync();
+    }
+
     private static async Task<(WebApplication App, string BaseUrl)> StartServerAsync(IMongoDatabase database)
     {
         return await StartServerAsync(database, null);
@@ -293,4 +344,12 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
             await Task.Delay(50);
         }
     }
+}
+
+/// <summary>POCO used to exercise typed client-side deserialization of snapshot/changes.</summary>
+public sealed class Order
+{
+    public string _id { get; set; } = "";
+    public string status { get; set; } = "";
+    public long total { get; set; }
 }
