@@ -234,6 +234,136 @@ public sealed class PulseHubTests
     }
 
     [Fact]
+    public async Task FilteredSubscription_UpdateFlipsOutOfFilter_DeliversSyntheticDelete()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+        server.ChangeSource.SnapshotProvider = (source, filter, ct) => Task.FromResult(
+            ((IReadOnlyList<IReadOnlyDictionary<string, object?>>)new IReadOnlyDictionary<string, object?>[]
+            {
+                new Dictionary<string, object?> { ["_id"] = "doc-1", ["status"] = "pending" },
+            }, new ResumeToken("fake:orders", Array.Empty<byte>())));
+
+        await client.InvokeAsync<string>("Subscribe", "orders",
+            """{"field":"status","op":"eq","value":"pending"}""");
+
+        // Update flips doc-1 out of the filter → synthetic delete so live lists drop it.
+        await server.ChangeSource.PublishAsync(new ChangeEvent(
+            "orders", ChangeKind.Update, "doc-1",
+            new Dictionary<string, object?> { ["_id"] = "doc-1", ["status"] = "shipped" },
+            new Dictionary<string, object?> { ["status"] = "shipped" },
+            new ResumeToken("fake:orders", new byte[0]), DateTimeOffset.UtcNow));
+
+        var msg = await ReadMessageAsync(received);
+        Assert.Equal(ChangeKind.Delete, msg.Kind);
+        Assert.Equal("doc-1", msg.DocumentId);
+        Assert.Null(msg.Document);
+    }
+
+    [Fact]
+    public async Task FilteredSubscription_UpdateFlipsIntoFilter_DeliversInsert()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+
+        // Empty snapshot: doc-2 was not matching before, so the subscriber never saw it.
+        await client.InvokeAsync<string>("Subscribe", "orders",
+            """{"field":"status","op":"eq","value":"pending"}""");
+
+        await server.ChangeSource.PublishAsync(new ChangeEvent(
+            "orders", ChangeKind.Update, "doc-2",
+            new Dictionary<string, object?> { ["_id"] = "doc-2", ["status"] = "pending" },
+            new Dictionary<string, object?> { ["status"] = "pending" },
+            new ResumeToken("fake:orders", new byte[0]), DateTimeOffset.UtcNow));
+
+        var msg = await ReadMessageAsync(received);
+        Assert.Equal(ChangeKind.Insert, msg.Kind);
+        Assert.Equal("doc-2", msg.DocumentId);
+        Assert.Equal("pending", msg.Document!["status"]);
+    }
+
+    [Fact]
+    public async Task FilteredSubscription_UpdateKeepsMatching_DeliversUpdate()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+        server.ChangeSource.SnapshotProvider = (source, filter, ct) => Task.FromResult(
+            ((IReadOnlyList<IReadOnlyDictionary<string, object?>>)new IReadOnlyDictionary<string, object?>[]
+            {
+                new Dictionary<string, object?> { ["_id"] = "doc-1", ["status"] = "pending" },
+            }, new ResumeToken("fake:orders", Array.Empty<byte>())));
+
+        await client.InvokeAsync<string>("Subscribe", "orders",
+            """{"field":"status","op":"eq","value":"pending"}""");
+
+        await server.ChangeSource.PublishAsync(new ChangeEvent(
+            "orders", ChangeKind.Update, "doc-1",
+            new Dictionary<string, object?> { ["_id"] = "doc-1", ["status"] = "pending", ["total"] = 150 },
+            new Dictionary<string, object?> { ["total"] = 150L },
+            new ResumeToken("fake:orders", new byte[0]), DateTimeOffset.UtcNow));
+
+        var msg = await ReadMessageAsync(received);
+        Assert.Equal(ChangeKind.Update, msg.Kind);
+        Assert.Equal("doc-1", msg.DocumentId);
+        Assert.Equal(150L, msg.UpdatedFields!["total"]);
+    }
+
+    [Fact]
+    public async Task FilteredSubscription_UpdateStaysNonMatching_DeliversNothing()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+        await client.InvokeAsync<string>("Subscribe", "orders",
+            """{"field":"status","op":"eq","value":"pending"}""");
+
+        await server.ChangeSource.PublishAsync(new ChangeEvent(
+            "orders", ChangeKind.Update, "doc-3",
+            new Dictionary<string, object?> { ["_id"] = "doc-3", ["status"] = "shipped" },
+            new Dictionary<string, object?> { ["status"] = "shipped" },
+            new ResumeToken("fake:orders", new byte[0]), DateTimeOffset.UtcNow));
+
+        await AssertNoMessageAsync(received);
+    }
+
+    [Fact]
+    public async Task FilteredSubscription_FlipsOutThenBackIn_TracksTransitions()
+    {
+        await using var server = await PulseTestServer.StartAsync();
+        await using var client = await ConnectAsync(server.BaseUrl);
+        var received = SubscribeAsync(client, "orders");
+        server.ChangeSource.SnapshotProvider = (source, filter, ct) => Task.FromResult(
+            ((IReadOnlyList<IReadOnlyDictionary<string, object?>>)new IReadOnlyDictionary<string, object?>[]
+            {
+                new Dictionary<string, object?> { ["_id"] = "doc-1", ["status"] = "pending" },
+            }, new ResumeToken("fake:orders", Array.Empty<byte>())));
+
+        await client.InvokeAsync<string>("Subscribe", "orders",
+            """{"field":"status","op":"eq","value":"pending"}""");
+
+        // Out of the filter.
+        await server.ChangeSource.PublishAsync(new ChangeEvent(
+            "orders", ChangeKind.Update, "doc-1",
+            new Dictionary<string, object?> { ["_id"] = "doc-1", ["status"] = "shipped" },
+            new Dictionary<string, object?> { ["status"] = "shipped" },
+            new ResumeToken("fake:orders", new byte[0]), DateTimeOffset.UtcNow));
+        Assert.Equal(ChangeKind.Delete, (await ReadMessageAsync(received)).Kind);
+
+        // Back in: the subscriber never saw the doc as matching, so it's an insert again.
+        await server.ChangeSource.PublishAsync(new ChangeEvent(
+            "orders", ChangeKind.Update, "doc-1",
+            new Dictionary<string, object?> { ["_id"] = "doc-1", ["status"] = "pending" },
+            new Dictionary<string, object?> { ["status"] = "pending" },
+            new ResumeToken("fake:orders", new byte[0]), DateTimeOffset.UtcNow));
+        var msg = await ReadMessageAsync(received);
+        Assert.Equal(ChangeKind.Insert, msg.Kind);
+        Assert.Equal("doc-1", msg.DocumentId);
+    }
+
+    [Fact]
     public async Task Subscribe_DeliversSnapshotBeforeChanges()
     {
         await using var server = await PulseTestServer.StartAsync();

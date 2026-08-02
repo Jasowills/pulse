@@ -116,6 +116,21 @@ public class SubscriptionRegistry
             throw;
         }
 
+        // Seed the match-transition tracker from the snapshot. The snapshot reflects every
+        // change at or before the cut point, so re-deriving the tracked set here is both
+        // correct and immune to changes that raced the snapshot fetch.
+        lock (_sync)
+        {
+            subscription.TrackedIds.Clear();
+            foreach (var document in snapshot.Documents)
+            {
+                if (document.TryGetValue("_id", out var id) && id is not null)
+                {
+                    subscription.TrackedIds.Add(id.ToString()!);
+                }
+            }
+        }
+
         try
         {
             await _hubContext.Clients.Client(connectionId)
@@ -217,9 +232,9 @@ public class SubscriptionRegistry
 
     private async Task FanOutAsync(string source, ChangeEvent change)
     {
-        Subscription[] subscriptions;
-        SourceState state;
+        SourceState? state;
         long sequence;
+        List<(Subscription Subscription, ChangeEvent Change)> deliveries = new();
         lock (_sync)
         {
             if (!_sources.TryGetValue(source, out state!))
@@ -228,17 +243,19 @@ public class SubscriptionRegistry
             }
 
             sequence = ++state.EmittedCount;
-            subscriptions = state.Subscriptions.Values.ToArray();
+            foreach (var subscription in state.Subscriptions.Values)
+            {
+                var delivery = DecideDelivery(change, subscription);
+                if (delivery is not null)
+                {
+                    deliveries.Add((subscription, delivery));
+                }
+            }
         }
 
-        foreach (var subscription in subscriptions)
+        foreach (var (subscription, delivery) in deliveries)
         {
-            if (!ShouldDeliver(change, subscription))
-            {
-                continue;
-            }
-
-            if (!subscription.Queue.Writer.TryWrite(new QueuedChange(sequence, change)))
+            if (!subscription.Queue.Writer.TryWrite(new QueuedChange(sequence, delivery)))
             {
                 _logger.LogWarning(
                     "Failed to enqueue change for source '{Source}' to subscription '{SubscriptionId}'.",
@@ -301,18 +318,61 @@ public class SubscriptionRegistry
     }
 
     /// <summary>
-    /// Applies the subscription's filter to document changes. Deletes are always delivered
-    /// (their FullDocument is null, so they can't be evaluated — clients need the removal
-    /// either way); changes with no document body are delivered rather than silently dropped.
+    /// Decides what a subscription sees for a change, handling match transitions. Deletes
+    /// are always delivered (their FullDocument is null, so they can't be evaluated).
+    /// For filtered subscriptions an update that flips a document out of the filter becomes
+    /// a synthetic delete (so live lists drop the row) and one that flips it in becomes an
+    /// insert (so it appears even though the subscriber never saw the original insert).
+    /// Requires the registry lock; mutates <see cref="Subscription.TrackedIds"/>.
     /// </summary>
-    private bool ShouldDeliver(ChangeEvent change, Subscription subscription)
+    private ChangeEvent? DecideDelivery(ChangeEvent change, Subscription subscription)
     {
-        if (subscription.Where is null || change.Kind == ChangeKind.Delete || change.FullDocument is null)
+        if (subscription.Where is null)
         {
-            return true;
+            return change;
         }
 
-        return _matcher.Matches(change.FullDocument, new SubscriptionFilter(change.Source, subscription.Where));
+        switch (change.Kind)
+        {
+            case ChangeKind.Delete:
+                subscription.TrackedIds.Remove(change.DocumentId);
+                return change;
+
+            case ChangeKind.Insert:
+                if (change.FullDocument is null
+                    || _matcher.Matches(change.FullDocument, new SubscriptionFilter(change.Source, subscription.Where)))
+                {
+                    subscription.TrackedIds.Add(change.DocumentId);
+                    return change;
+                }
+
+                return null;
+
+            case ChangeKind.Update:
+            case ChangeKind.Replace:
+                if (change.FullDocument is null)
+                {
+                    // No post-image to evaluate; deliver as-is without touching the tracked set.
+                    return change;
+                }
+
+                if (_matcher.Matches(change.FullDocument, new SubscriptionFilter(change.Source, subscription.Where)))
+                {
+                    // Didn't match → now matches: surface as an insert so the subscriber
+                    // learns about the document even though it missed the original insert.
+                    return subscription.TrackedIds.Add(change.DocumentId)
+                        ? change with { Kind = ChangeKind.Insert }
+                        : change;
+                }
+
+                // Matched → no longer matches: synthetic delete so live lists drop the row.
+                return subscription.TrackedIds.Remove(change.DocumentId)
+                    ? change with { Kind = ChangeKind.Delete, FullDocument = null }
+                    : null;
+
+            default:
+                return change;
+        }
     }
 
     private readonly record struct QueuedChange(long Sequence, ChangeEvent Change);
@@ -321,7 +381,17 @@ public class SubscriptionRegistry
         string Id,
         string ConnectionId,
         FilterExpr? Where,
-        Channel<QueuedChange> Queue);
+        Channel<QueuedChange> Queue)
+    {
+        /// <summary>
+        /// Document ids currently matching this subscription's filter (seeded from the
+        /// snapshot, kept in sync by <see cref="SubscriptionRegistry.DecideDelivery"/>).
+        /// Used to detect match transitions — an update that flips a doc out of the filter
+        /// becomes a synthetic delete; one that flips a doc in becomes an insert. Guarded
+        /// by the registry lock.
+        /// </summary>
+        public readonly HashSet<string> TrackedIds = new(StringComparer.Ordinal);
+    }
 
     private sealed class SourceState
     {

@@ -6,7 +6,7 @@ Pulse is a .NET package suite that lets clients subscribe to a query (collection
 
 Target framework: **.NET 8** (LTS, MAUI-compatible) for all projects.
 
-> **Status: v0.1 MVP — in progress.** Steps 0–8 of the [build order](#build-status) are done: scaffold, `Pulse.Abstractions`, `Pulse.Mongo`'s change-stream `WatchAsync` (verified end-to-end against a real Testcontainers Mongo replica set), `Pulse.Server`'s `PulseHub` broadcast with shared per-source watches and `AddMongoSource`, server-side filter matching (`DictionaryFilterMatcher`), gap-free snapshot delivery on subscribe (`GetSnapshotAsync` with watch-first as-of token capture), resume-token persistence (`IResumeTokenStore`, in-memory + file-based, with stale-token resync verified across a server restart), the `Pulse.Client` SDK's `Subscribe<T>` (typed snapshot + live changes, `Current` cache, in-order message processing), and automatic client reconnect with resubscribe-treats-as-fresh-snapshot. API shapes below are the design contract and will land in that order.
+> **Status: v0.1 MVP — in progress.** Steps 0–9 of the [build order](#build-status) are done: scaffold, `Pulse.Abstractions`, `Pulse.Mongo`'s change-stream `WatchAsync` (verified end-to-end against a real Testcontainers Mongo replica set), `Pulse.Server`'s `PulseHub` broadcast with shared per-source watches and `AddMongoSource`, server-side filter matching (`DictionaryFilterMatcher`), gap-free snapshot delivery on subscribe (`GetSnapshotAsync` with watch-first as-of token capture), resume-token persistence (`IResumeTokenStore`, in-memory + file-based, with stale-token resync verified across a server restart), the `Pulse.Client` SDK's `Subscribe<T>` (typed snapshot + live changes, `Current` cache, in-order message processing), automatic client reconnect with resubscribe-treats-as-fresh-snapshot, and match-transition handling (an update that flips a doc out of a filter becomes a synthetic delete; one that flips it in becomes an insert). API shapes below are the design contract and will land in that order.
 
 ---
 
@@ -244,7 +244,7 @@ The v0.1 implementation follows this order — each step is independently demoab
 | 6 | Resume-token persistence (`IResumeTokenStore`, in-memory + file-based) | Done |
 | 7 | `Pulse.Client` basic `Subscribe<T>` | Done |
 | 8 | Client reconnect/resubscribe | Done |
-| 9 | Match-transition logic | Pending |
+| 9 | Match-transition logic | Done |
 | 10 | `Pulse.Sample.MauiClient` (MAUI list bound to `Current`) | Pending |
 
 ## Roadmap / explicitly deferred

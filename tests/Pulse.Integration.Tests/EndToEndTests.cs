@@ -105,7 +105,8 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
         await AssertNoMessageAsync(received);
 
         // A live update on a matching doc arrives with updated fields.
-        // (Updates that flip a doc OUT of the filter are match-transition logic — step 9.)
+        // (Updates that flip a doc in/out of the filter are match-transition logic, covered
+        // in PulseClient_UpdateTransitions_ReflectInCurrent.)
         await _orders.UpdateOneAsync(
             Builders<BsonDocument>.Filter.Eq("_id", "c"),
             Builders<BsonDocument>.Update.Set("total", 150));
@@ -320,6 +321,49 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
         await sub.UnsubscribeAsync();
         await client.DisposeAsync();
         await serverB.App.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PulseClient_UpdateTransitions_ReflectInCurrent()
+    {
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "a" }, { "status", "pending" } });
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "b" }, { "status", "shipped" } });
+
+        var server = await StartServerAsync(_database);
+        await using var client = new PulseClient(server.BaseUrl + "/pulse");
+        await client.ConnectAsync();
+
+        var snapshotTcs = new TaskCompletionSource<IReadOnlyList<Order>>();
+        var sub = await client.Subscribe<Order>("orders", new FieldCompare("status", CompareOp.Eq, "pending"));
+        sub.OnSnapshot += docs => snapshotTcs.TrySetResult(docs);
+        await snapshotTcs.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal("a", Assert.Single(sub.Current)._id);
+
+        var changes = Channel.CreateUnbounded<PulseChange<Order>>();
+        sub.OnChange += change => changes.Writer.TryWrite(change);
+
+        // Flip a out of the filter → the subscriber gets a synthetic delete.
+        await _orders.UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", "a"),
+            Builders<BsonDocument>.Update.Set("status", "shipped"));
+        var del = await ReadMessageAsync(changes);
+        Assert.Equal(ChangeKind.Delete, del.Kind);
+        Assert.Equal("a", del.DocumentId);
+        Assert.Null(del.Document);
+        Assert.Empty(sub.Current);
+
+        // Flip b into the filter → it arrives as an insert (the subscriber never saw it matching).
+        await _orders.UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", "b"),
+            Builders<BsonDocument>.Update.Set("status", "pending"));
+        var ins = await ReadMessageAsync(changes);
+        Assert.Equal(ChangeKind.Insert, ins.Kind);
+        Assert.Equal("b", ins.DocumentId);
+        Assert.Equal("b", Assert.Single(sub.Current)._id);
+
+        await sub.UnsubscribeAsync();
+        await client.DisposeAsync();
+        await server.App.DisposeAsync();
     }
 
     private static async Task<(WebApplication App, string BaseUrl)> StartServerAsync(IMongoDatabase database)
