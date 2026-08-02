@@ -25,6 +25,9 @@ public sealed class PulseClient : IAsyncDisposable
 
     public JsonSerializerOptions JsonOptions => _json;
 
+    /// <summary>Current connection state (useful for surfacing reconnect status to the UI).</summary>
+    public HubConnectionState State => _connection.State;
+
     /// <summary>Raised when the connection has fully closed (final failure or manual stop).</summary>
     public event Func<Exception?, Task>? OnDisconnected;
 
@@ -48,6 +51,7 @@ public sealed class PulseClient : IAsyncDisposable
         _connection.On<PulseSnapshotMessage>("PulseSnapshot", Dispatch);
         _connection.On<PulseChangeMessage>("PulseChange", Dispatch);
         _connection.Closed += OnClosedAsync;
+        _connection.Reconnected += OnReconnectedAsync;
     }
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -76,7 +80,7 @@ public sealed class PulseClient : IAsyncDisposable
             .InvokeAsync<string>("Subscribe", source, whereJson, cancellationToken)
             .ConfigureAwait(false);
 
-        var subscription = new PulseSubscription<T>(subscriptionId, source, _json, id => UnsubscribeAsync(id));
+        var subscription = new PulseSubscription<T>(subscriptionId, source, where, _json, id => UnsubscribeAsync(id));
         lock (_sync)
         {
             _subscriptions[subscriptionId] = subscription;
@@ -174,6 +178,59 @@ public sealed class PulseClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// After a reconnect the server no longer knows our subscription ids, so every active
+    /// subscription is re-created. The result is treated as a fresh snapshot: the cached
+    /// <c>Current</c> is cleared and <c>OnSnapshot</c> fires again with the new documents.
+    /// </summary>
+    private async Task OnReconnectedAsync(string? _)
+    {
+        IPulseSubscriptionHost[] subscriptions;
+        lock (_sync)
+        {
+            subscriptions = _subscriptions.Values.ToArray();
+        }
+
+        foreach (var subscription in subscriptions)
+        {
+            try
+            {
+                await ResubscribeAsync(subscription).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Re-subscribing will be retried on the next successful reconnect.
+            }
+        }
+    }
+
+    private async Task ResubscribeAsync(IPulseSubscriptionHost subscription)
+    {
+        var whereJson = subscription.Where is null ? null : JsonSerializer.Serialize(subscription.Where);
+        var newId = await _connection
+            .InvokeAsync<string>("Subscribe", subscription.Source, whereJson)
+            .ConfigureAwait(false);
+
+        lock (_sync)
+        {
+            _subscriptions.Remove(subscription.Id);
+            _pending.Remove(subscription.Id);
+            _subscriptions[newId] = subscription;
+
+            // Drop stale cache entries before any pending/fresh snapshot is applied.
+            subscription.Reset();
+            if (_pending.Remove(newId, out var buffered))
+            {
+                foreach (var message in buffered)
+                {
+                    subscription.Enqueue(message);
+                }
+            }
+
+            subscription.UpdateId(newId);
+        }
+    }
+
     private void ThrowIfDisposed()
     {
         if (_disposed)
@@ -188,7 +245,15 @@ internal interface IPulseSubscriptionHost
 {
     string Id { get; }
 
+    string Source { get; }
+
+    FilterExpr? Where { get; }
+
     void Enqueue(object message);
 
     void Close();
+
+    void UpdateId(string newId);
+
+    void Reset();
 }

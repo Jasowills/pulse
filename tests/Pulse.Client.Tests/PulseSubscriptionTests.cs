@@ -18,7 +18,7 @@ public class PulseSubscriptionTests
     [Fact]
     public async Task Snapshot_PopulatesCurrent_AndRaisesOnSnapshot()
     {
-        var sub = new PulseSubscription<Order>("sub-1", "orders", Options, _ => Task.CompletedTask);
+        var sub = new PulseSubscription<Order>("sub-1", "orders", null, Options, _ => Task.CompletedTask);
         var snapshot = new TaskCompletionSource<IReadOnlyList<Order>>();
         sub.OnSnapshot += docs => snapshot.TrySetResult(docs);
         try
@@ -43,7 +43,7 @@ public class PulseSubscriptionTests
     [Fact]
     public async Task Snapshot_ReplacesCurrent_NotMerge()
     {
-        var sub = new PulseSubscription<Order>("sub-1", "orders", Options, _ => Task.CompletedTask);
+        var sub = new PulseSubscription<Order>("sub-1", "orders", null, Options, _ => Task.CompletedTask);
         var snapshots = Channel.CreateUnbounded<IReadOnlyList<Order>>();
         sub.OnSnapshot += docs => snapshots.Writer.TryWrite(docs);
         try
@@ -73,7 +73,7 @@ public class PulseSubscriptionTests
     [Fact]
     public async Task Changes_UpdateCurrent_AndRaiseOnChange()
     {
-        var sub = new PulseSubscription<Order>("sub-1", "orders", Options, _ => Task.CompletedTask);
+        var sub = new PulseSubscription<Order>("sub-1", "orders", null, Options, _ => Task.CompletedTask);
         var changes = Channel.CreateUnbounded<PulseChange<Order>>();
         sub.OnChange += change => changes.Writer.TryWrite(change);
         try

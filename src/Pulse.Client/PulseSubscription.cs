@@ -18,18 +18,27 @@ internal sealed class PulseSubscription<T> : IPulseSubscription<T>, IPulseSubscr
     private readonly Func<string, Task> _unsubscribe;
     private readonly Dictionary<string, T> _documents = new(StringComparer.Ordinal);
 
-    public string Id { get; }
+    public string Id { get; set; }
 
     public string Source { get; }
+
+    /// <summary>The subscription filter, kept so <see cref="PulseClient"/> can re-subscribe after a reconnect.</summary>
+    internal FilterExpr? Where { get; }
 
     public event Action<IReadOnlyList<T>>? OnSnapshot;
 
     public event Action<PulseChange<T>>? OnChange;
 
-    internal PulseSubscription(string id, string source, JsonSerializerOptions json, Func<string, Task> unsubscribe)
+    internal PulseSubscription(
+        string id,
+        string source,
+        FilterExpr? where,
+        JsonSerializerOptions json,
+        Func<string, Task> unsubscribe)
     {
         Id = id;
         Source = source;
+        Where = where;
         _json = json;
         _unsubscribe = unsubscribe;
         _processor = Task.Run(ProcessAsync);
@@ -57,6 +66,12 @@ internal sealed class PulseSubscription<T> : IPulseSubscription<T>, IPulseSubscr
     public void Close()
         => _inbox.Writer.TryComplete();
 
+    private static readonly ResetMessage ResetInstance = new();
+
+    private sealed class ResetMessage
+    {
+    }
+
     /// <summary>Returns when everything enqueued before this call has been processed.</summary>
     internal Task WaitForIdleAsync()
     {
@@ -69,6 +84,21 @@ internal sealed class PulseSubscription<T> : IPulseSubscription<T>, IPulseSubscr
         return signal.Task;
     }
 
+    /// <summary>
+    /// Queues a reset so stale documents are dropped, in order, before the fresh snapshot
+    /// that follows a reconnect. Must run through the inbox (not directly on the caller's
+    /// thread) so it can never clear documents after the new snapshot has been applied.
+    /// </summary>
+    internal void Reset()
+        => _inbox.Writer.TryWrite(ResetInstance);
+
+    public void UpdateId(string newId)
+        => Id = newId;
+
+    FilterExpr? IPulseSubscriptionHost.Where => Where;
+
+    void IPulseSubscriptionHost.Reset() => Reset();
+
     private async Task ProcessAsync()
     {
         await foreach (var message in _inbox.Reader.ReadAllAsync().ConfigureAwait(false))
@@ -79,6 +109,13 @@ internal sealed class PulseSubscription<T> : IPulseSubscription<T>, IPulseSubscr
                 {
                     case TaskCompletionSource<bool> signal:
                         signal.TrySetResult(true);
+                        break;
+                    case ResetMessage:
+                        lock (_documents)
+                        {
+                            _documents.Clear();
+                        }
+
                         break;
                     case PulseSnapshotMessage snapshot:
                         ApplySnapshot(snapshot);

@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Pulse.Client.Tests" />
+    <InternalsVisibleTo Include="Pulse.Integration.Tests" />
   </ItemGroup>
 
 </Project>

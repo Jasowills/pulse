@@ -1,3 +1,4 @@
+using System.Net.Sockets;
 using System.Threading.Channels;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -263,17 +264,80 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
         await server.App.DisposeAsync();
     }
 
-    private static async Task<(WebApplication App, string BaseUrl)> StartServerAsync(IMongoDatabase database)
+    [Fact]
+    public async Task PulseClient_Reconnects_Resubscribes_AndFiresFreshSnapshot()
     {
-        return await StartServerAsync(database, null);
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "a" }, { "status", "pending" } });
+
+        var serverA = await StartServerAsync(_database);
+        var port = new Uri(serverA.BaseUrl).Port;
+
+        await using var client = new PulseClient(serverA.BaseUrl + "/pulse");
+        await client.ConnectAsync();
+
+        var snapshotCount = 0;
+        var secondSnapshot = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sub = await client.Subscribe<Order>("orders", new FieldCompare("status", CompareOp.Eq, "pending"));
+        sub.OnSnapshot += _ =>
+        {
+            if (Interlocked.Increment(ref snapshotCount) == 2)
+            {
+                secondSnapshot.TrySetResult(true);
+            }
+        };
+
+        await WaitUntilAsync(() => Volatile.Read(ref snapshotCount) == 1);
+
+        // Kill the server: the client drops and starts automatic reconnect attempts.
+        await serverA.App.StopAsync();
+        await serverA.App.DisposeAsync();
+
+        // Wait for the client to notice the drop AND for serverA's port to be fully
+        // released before the new server starts, so the client reconnects exactly once
+        // (its immediate retry fails against the closed port, the next hits serverB).
+        await WaitUntilAsync(() => client.State == HubConnectionState.Reconnecting);
+        await WaitUntilAsync(() => !IsPortOpen("127.0.0.1", port));
+
+        // Bring it back on the same port; the client reconnects and re-subscribes,
+        // treating the result as a fresh snapshot.
+        var serverB = await StartServerAsync(_database, null, port);
+        await secondSnapshot.Task.WaitAsync(TimeSpan.FromSeconds(20));
+
+        Assert.Equal(2, snapshotCount);
+        Assert.Equal("a", Assert.Single(sub.Current)._id);
+
+        // Live changes still flow on the resubscribed connection.
+        var changes = Channel.CreateUnbounded<PulseChange<Order>>();
+        sub.OnChange += change => changes.Writer.TryWrite(change);
+        await _orders.InsertOneAsync(new BsonDocument { { "_id", "b" }, { "status", "pending" } });
+        var change = await ReadMessageAsync(changes);
+        Assert.Equal("b", change.DocumentId);
+        Assert.Equal(ChangeKind.Insert, change.Kind);
+        Assert.NotNull(change.Document);
+        await ((PulseSubscription<Order>)sub).WaitForIdleAsync();
+        Assert.Equal(2, sub.Current.Count);
+
+        await sub.UnsubscribeAsync();
+        await client.DisposeAsync();
+        await serverB.App.DisposeAsync();
     }
+
+    private static async Task<(WebApplication App, string BaseUrl)> StartServerAsync(IMongoDatabase database)
+        => await StartServerAsync(database, null, null);
 
     private static async Task<(WebApplication App, string BaseUrl)> StartServerAsync(
         IMongoDatabase database,
         string? resumeTokenDirectory)
+        => await StartServerAsync(database, resumeTokenDirectory, null);
+
+    private static async Task<(WebApplication App, string BaseUrl)> StartServerAsync(
+        IMongoDatabase database,
+        string? resumeTokenDirectory,
+        int? port)
     {
+        var url = port is null ? "http://127.0.0.1:0" : $"http://127.0.0.1:{port}";
         var builder = WebApplication.CreateBuilder();
-        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        builder.WebHost.UseUrls(url);
         builder.Logging.ClearProviders();
         builder.Services.AddSignalR();
         builder.Services.AddSingleton(database);
@@ -328,6 +392,20 @@ public sealed class EndToEndTests : IClassFixture<MongoContainerFixture>, IAsync
         catch (OperationCanceledException)
         {
             return default;
+        }
+    }
+
+    private static bool IsPortOpen(string host, int port)
+    {
+        using var client = new System.Net.Sockets.TcpClient();
+        try
+        {
+            client.Connect(host, port);
+            return true;
+        }
+        catch (SocketException)
+        {
+            return false;
         }
     }
 
