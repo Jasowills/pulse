@@ -645,7 +645,10 @@ public sealed class SqlServerChangeSource : IChangeSource
     /// <summary>
     /// Coerces a raw SQL cell into a wire value. String columns that hold a valid JSON object or
     /// array are embedded as nested documents (mirroring <c>jsonb</c> columns on Postgres);
-    /// anything else — plain text, scalars, non-string columns — is delivered as-is.
+    /// anything else — plain text, scalars, non-string columns — is delivered as-is. Floating
+    /// and decimal columns are normalized like JSON numbers (integral values become
+    /// <see cref="long"/>, otherwise <see cref="double"/>) so client-side numeric assertions and
+    /// the <c>ObjectToInferredTypesConverter</c> agree across providers.
     /// </summary>
     private static object? CoerceCell(object? value, bool isStringType)
     {
@@ -669,8 +672,29 @@ public sealed class SqlServerChangeSource : IChangeSource
             }
         }
 
-        return value;
+        return value switch
+        {
+            decimal dec => NormalizeNumber(dec),
+            double dbl => NormalizeNumber(dbl),
+            float flt => NormalizeNumber(flt),
+            _ => value,
+        };
     }
+
+    private const double MaxLongAsDouble = 9223372036854775808.0; // 2^63, exclusive upper bound
+
+    private static object? NormalizeNumber(double value)
+        => value == Math.Truncate(value) && value >= long.MinValue && value < MaxLongAsDouble
+            ? (object)Convert.ToInt64(value, CultureInfo.InvariantCulture)
+            : value;
+
+    private static object? NormalizeNumber(decimal value)
+        => value == decimal.Truncate(value) && value >= long.MinValue && value <= long.MaxValue
+            ? (object)Convert.ToInt64(value, CultureInfo.InvariantCulture)
+            : (object)(double)value;
+
+    private static object? NormalizeNumber(float value)
+        => NormalizeNumber((double)value);
 
     private static string ResolvedSource(string source)
     {

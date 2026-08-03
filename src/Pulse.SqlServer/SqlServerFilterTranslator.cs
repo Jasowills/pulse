@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Globalization;
+using System.Text;
 using Pulse.Abstractions;
 
 namespace Pulse.SqlServer;
@@ -183,16 +184,21 @@ public static class SqlServerFilterTranslator
     }
 
     private static string JsonPath(string[] path)
-        => "$." + string.Join(".", path.Select(EscapePathSegment));
-
-    private static string EscapePathSegment(string segment)
     {
-        if (segment.Length > 0 && segment.All(static c => char.IsLetterOrDigit(c) || c == '_'))
+        var sb = new StringBuilder("$");
+        foreach (var segment in path)
         {
-            return segment;
+            if (segment.Length > 0 && segment.All(static c => char.IsLetterOrDigit(c) || c == '_'))
+            {
+                sb.Append('.').Append(segment);
+            }
+            else
+            {
+                sb.Append("[\"").Append(segment.Replace("\"", "\\\"", StringComparison.Ordinal)).Append("\"]");
+            }
         }
 
-        return $"[\"{segment.Replace("\"", "\\\"", StringComparison.Ordinal)}\"]";
+        return sb.ToString();
     }
 
     private static string Param(IDictionary<string, object> parameters, object value)

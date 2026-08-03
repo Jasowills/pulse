@@ -234,7 +234,7 @@ Caveats specific to Postgres:
 
 - **Writes before the first subscription are not captured.** The trigger is installed the first time a table is subscribed to; earlier writes are simply not in the change log (the subscribe-time snapshot covers them). The snapshot is always taken from the live table, so nothing is lost.
 - **Filter paths are JSON paths.** Filters navigate `to_jsonb(row)` with jsonb `#>`/`#>>`, so dotted paths (`customer.address.city`) and array indexes work, and comparisons preserve JSON types (a number field never equals a string filter value). Range comparisons require numeric or string filter values.
-- **The change log grows unbounded** in v0.2 (no pruning). A cleanup job that deletes rows below the minimum active resume token is planned.
+- **The change log no longer grows unbounded.** While watchers are active, a background cleanup job (`PostgresSourceOptions.PruneInterval`, default 1 minute) deletes rows below the **minimum floor across active watchers** for each source — the oldest shared-watch start point or resumed private-watch token, whichever is lower — so already-delivered history is reclaimed. A source with **no active watcher is never pruned**, so a resume token persisted across a restart stays valid even before any watcher reconnects.
 
 ## SQL Server provider (v0.3)
 
@@ -242,7 +242,7 @@ Caveats specific to Postgres:
 
 - **Native change tracking.** On first subscribe, the provider runs `ALTER DATABASE SET CHANGE_TRACKING = ON` (best-effort — it errors clearly if the login lacks permission) and `ALTER TABLE ... ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON)` per table. Watchers poll `CHANGETABLE(CHANGES schema.table, @version)` in 250 ms intervals; there is no trigger or change-log table of our own.
 - **`_id` = the primary key.** Each row is delivered with its single-column primary key exposed as `_id`. A table with no primary key or a composite primary key is rejected at subscribe time with an actionable error. Sources are resolved as `schema.table`; a bare table name defaults to `dbo`. `ProviderIdFor` is `sqlserver:{schema}.{table}`.
-- **Snapshot + resume tokens.** `GetSnapshotAsync` captures `CHANGE_TRACKING_CURRENT_VERSION()` *before* the snapshot query (watch-first), so live watching picks up without a gap or duplicate. A resume token is the 8-byte big-endian version; a token that points past the current version, belongs to a different provider, or has been cleaned up by retention (`22119` / `22122`) is rejected as stale via `ResumeTokenInvalidException`.
+- **Snapshot + resume tokens.** `GetSnapshotAsync` captures `CHANGE_TRACKING_CURRENT_VERSION()` *before* the snapshot query (watch-first), so live watching picks up without a gap or duplicate. A resume token is an opaque 8-byte encoding of the change-tracking version; a token that points past the current version, belongs to a different provider, or has been cleaned up by retention (`22119` / `22122`) is rejected as stale via `ResumeTokenInvalidException`.
 - **Change kinds.** SQL Server emits `insert`, `update`, and `delete` (no `replace`). Updates carry the changed columns in `updated_fields`, decoded from the per-row `SYS_CHANGE_COLUMNS` mask via `CHANGE_TRACKING_IS_COLUMN_IN_MASK`.
 - **JSON columns.** `nvarchar`/`varchar` columns that hold a valid JSON object or array are embedded as nested documents (mirroring `jsonb` on Postgres); plain text stays a string.
 
@@ -319,6 +319,7 @@ The v0.1 implementation follows this order — each step is independently demoab
 | 3 | `AddPostgresSource` DI extension | Done |
 | 4 | Postgres unit + end-to-end tests (Testcontainers, restart-resume) | Done |
 | 5 | `Pulse.SqlServer` provider (change tracking) | Done |
+| 6 | Postgres change-log pruning (periodic cleanup below the minimum active watcher floor) | Done |
 
 **v0.3 — third provider:**
 
