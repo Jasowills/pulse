@@ -107,19 +107,28 @@ public sealed class PostgresChangeSource : IChangeSource
     private readonly NpgsqlDataSource _dataSource;
     private readonly ILogger _logger;
     private readonly TimeSpan _pollInterval;
+    private readonly TimeSpan _pruneInterval;
     private readonly object _sync = new();
     private readonly Dictionary<string, SharedWatch> _sharedWatches = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _pkColumns = new(StringComparer.Ordinal);
+
+    /// <summary>Active watcher floors keyed by resolved source, then by unique watcher id. Pruning never deletes a row a live watcher could still reference.</summary>
+    private readonly Dictionary<string, Dictionary<long, long>> _positions = new(StringComparer.Ordinal);
+    private long _nextWatcherId;
+    private CancellationTokenSource? _pruneCts;
+    private Task? _pruneTask;
     private int _bootstrapped;
 
     public PostgresChangeSource(
         NpgsqlDataSource dataSource,
         ILogger<PostgresChangeSource>? logger = null,
-        TimeSpan? pollInterval = null)
+        TimeSpan? pollInterval = null,
+        TimeSpan? pruneInterval = null)
     {
         _dataSource = dataSource ?? throw new ArgumentNullException(nameof(dataSource));
         _logger = logger ?? NullLogger<PostgresChangeSource>.Instance;
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(250);
+        _pruneInterval = pruneInterval ?? TimeSpan.FromMinutes(1);
     }
 
     public string ProviderIdFor(string source)
@@ -442,7 +451,9 @@ public sealed class PostgresChangeSource : IChangeSource
 
         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var loop = PumpAsync(source, resolved, onChange, seq, onSynced: null, cts.Token);
-        return new PrivateWatchHandle(cts, loop);
+        var watcherId = NextWatcherId();
+        AddPosition(resolved, watcherId, seq);
+        return new PrivateWatchHandle(this, resolved, watcherId, cts, loop);
     }
 
     /// <summary>Registers a callback on a shared per-source watcher, creating it on first use.</summary>
@@ -570,6 +581,162 @@ public sealed class PostgresChangeSource : IChangeSource
         return BitConverter.ToInt64(opaque, 0);
     }
 
+    /// <summary>
+    /// Records a watcher start position for a source and ensures the pruning job is
+    /// running. The pruning floor for a source is the minimum position across its active
+    /// watchers; anything below it has been consumed (or superseded by a snapshot) and can
+    /// be deleted.
+    /// </summary>
+    private void AddPosition(string resolved, long watcherId, long seq)
+    {
+        lock (_sync)
+        {
+            if (!_positions.TryGetValue(resolved, out var floors) || floors is null)
+            {
+                floors = new Dictionary<long, long>();
+                _positions[resolved] = floors;
+            }
+
+            floors[watcherId] = seq;
+            if (_pruneTask is null)
+            {
+                var cts = new CancellationTokenSource();
+                _pruneCts = cts;
+                _pruneTask = PruneLoopAsync(cts);
+            }
+        }
+    }
+
+    private void RemovePosition(string resolved, long watcherId)
+    {
+        lock (_sync)
+        {
+            if (_positions.TryGetValue(resolved, out var floors) && floors is not null)
+            {
+                floors.Remove(watcherId);
+                if (floors.Count == 0)
+                {
+                    _positions.Remove(resolved);
+                }
+            }
+
+            if (_positions.Count == 0)
+            {
+                StopPrune();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Raises a watcher's pruning floor as it consumes the log (e.g. a shared watch
+    /// advancing past delivered rows). Watchers are keyed by a unique id (not their floor),
+    /// so two watchers at the same sequence are never conflated. A no-op if the watcher is
+    /// no longer registered, so a stale sync arriving after the watch was torn down cannot
+    /// leak a floor.
+    /// </summary>
+    private void UpdatePosition(string resolved, long watcherId, long seq)
+    {
+        lock (_sync)
+        {
+            if (_positions.TryGetValue(resolved, out var floors) && floors is not null && floors.ContainsKey(watcherId))
+            {
+                floors[watcherId] = seq;
+            }
+        }
+    }
+
+    private long NextWatcherId() => Interlocked.Increment(ref _nextWatcherId);
+
+    private void StopPrune()
+    {
+        var cts = _pruneCts;
+        _pruneCts = null;
+        _pruneTask = null;
+        cts?.Cancel();
+    }
+
+    private async Task PruneLoopAsync(CancellationTokenSource cts)
+    {
+        var token = cts.Token;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(_pruneInterval, token).ConfigureAwait(false);
+                    await PruneOnceAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Change-log pruning failed; retrying at the next interval.");
+                }
+            }
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_pruneCts, cts))
+                {
+                    _pruneCts = null;
+                    _pruneTask = null;
+                }
+            }
+
+            cts.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Deletes rows below each source's pruning floor. Sources with no live watcher have
+    /// no floor and are skipped, so a resume token persisted across a restart (before any
+    /// watcher reconnects) is never truncated out from under it.
+    /// </summary>
+    private async Task PruneOnceAsync(CancellationToken token)
+    {
+        Dictionary<string, long> floors;
+        lock (_sync)
+        {
+            floors = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var (source, watchers) in _positions)
+            {
+                var min = long.MaxValue;
+                foreach (var floor in watchers.Values)
+                {
+                    if (floor < min)
+                    {
+                        min = floor;
+                    }
+                }
+
+                if (min != long.MaxValue)
+                {
+                    floors[source] = min;
+                }
+            }
+        }
+
+        if (floors.Count == 0)
+        {
+            return;
+        }
+
+        await using var connection = await _dataSource.OpenConnectionAsync(token).ConfigureAwait(false);
+        foreach (var (source, floor) in floors)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "DELETE FROM pulse._changes WHERE source = @source AND seq < @floor";
+            command.Parameters.Add(new NpgsqlParameter("source", source));
+            command.Parameters.Add(new NpgsqlParameter("floor", floor));
+            await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>A shared per-source watcher that fans out to multiple subscribers.</summary>
     private sealed class SharedWatch
     {
@@ -581,6 +748,7 @@ public sealed class PostgresChangeSource : IChangeSource
         private readonly TimeSpan _pollInterval;
         private CancellationTokenSource? _cts;
         private Task? _startTask;
+        private readonly long _watcherId;
         private long _lastSeq;
         private int _consecutiveFailures;
 
@@ -591,6 +759,7 @@ public sealed class PostgresChangeSource : IChangeSource
             _resolved = ResolvedSource(source);
             _logger = owner._logger;
             _pollInterval = owner._pollInterval;
+            _watcherId = owner.NextWatcherId();
         }
 
         public void AddSubscriber(Func<ChangeEvent, Task> onChange) => _subscribers.Add(onChange);
@@ -618,6 +787,7 @@ public sealed class PostgresChangeSource : IChangeSource
             try
             {
                 _lastSeq = await _owner.GetCurrentMaxSeqAsync(_resolved, cts.Token).ConfigureAwait(false);
+                _owner.AddPosition(_resolved, _watcherId, _lastSeq);
                 _ = Task.Run(() => RunSupervisedAsync(cts));
             }
             catch (Exception)
@@ -676,6 +846,7 @@ public sealed class PostgresChangeSource : IChangeSource
             lock (_owner._sync)
             {
                 _lastSeq = seq;
+                _owner.UpdatePosition(_resolved, _watcherId, seq);
             }
         }
 
@@ -716,6 +887,7 @@ public sealed class PostgresChangeSource : IChangeSource
             }
 
             _cts = null;
+            _owner.RemovePosition(_resolved, _watcherId);
             cts.Cancel();
             cts.Dispose();
         }
@@ -774,12 +946,23 @@ public sealed class PostgresChangeSource : IChangeSource
 
     private sealed class PrivateWatchHandle : IAsyncDisposable
     {
+        private readonly PostgresChangeSource _owner;
+        private readonly string _resolved;
+        private readonly long _watcherId;
         private readonly CancellationTokenSource _cts;
         private readonly Task _loop;
         private bool _disposed;
 
-        public PrivateWatchHandle(CancellationTokenSource cts, Task loop)
+        public PrivateWatchHandle(
+            PostgresChangeSource owner,
+            string resolved,
+            long watcherId,
+            CancellationTokenSource cts,
+            Task loop)
         {
+            _owner = owner;
+            _resolved = resolved;
+            _watcherId = watcherId;
             _cts = cts;
             _loop = loop;
         }
@@ -795,6 +978,7 @@ public sealed class PostgresChangeSource : IChangeSource
             }
 
             _disposed = true;
+            _owner.RemovePosition(_resolved, _watcherId);
             _cts.Cancel();
             try
             {

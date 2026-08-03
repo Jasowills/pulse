@@ -282,13 +282,92 @@ public sealed class PostgresChangeSourceTests : IClassFixture<PostgresContainerF
         Assert.Contains("no primary key", ex.Message);
     }
 
-    [Fact]
+[Fact]
     public async Task MissingTable_IsRejectedWithActionableError()
     {
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => _source.WatchAsync(_table + "_missing", _ => Task.CompletedTask, null, CancellationToken.None));
-
         Assert.Contains("does not exist", ex.Message);
+    }
+
+    [Fact]
+    public async Task Pruning_DeletesOldRows_BelowAnActiveWatcherFloor()
+    {
+        var source = new PostgresChangeSource(
+            _fixture.DataSource,
+            pollInterval: TimeSpan.FromMilliseconds(50),
+            pruneInterval: TimeSpan.FromMilliseconds(50));
+        await InstallTriggerAsync(source, _table);
+
+        await InsertAsync(_table, "r1", "pending");
+        await InsertAsync(_table, "r2", "pending");
+        await InsertAsync(_table, "r3", "pending");
+
+        await using var sub = await SubscribeAsync(source, _table);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(600));
+
+        Assert.Equal(1L, await CountChangesAsync(_table));
+    }
+
+    [Fact]
+    public async Task Pruning_SparesLogsWithNoActiveWatcher()
+    {
+        var source = new PostgresChangeSource(
+            _fixture.DataSource,
+            pollInterval: TimeSpan.FromMilliseconds(50),
+            pruneInterval: TimeSpan.FromMilliseconds(50));
+        await InstallTriggerAsync(source, _table);
+
+        await InsertAsync(_table, "r1", "pending");
+
+        await Task.Delay(TimeSpan.FromMilliseconds(600));
+
+        Assert.Equal(1L, await CountChangesAsync(_table));
+    }
+
+    [Fact]
+    public async Task Pruning_RespectsAResumedWatchFloor_ThenDeletesAfterItEnds()
+    {
+        var source = new PostgresChangeSource(
+            _fixture.DataSource,
+            pollInterval: TimeSpan.FromMilliseconds(50),
+            pruneInterval: TimeSpan.FromMilliseconds(200));
+        await InstallTriggerAsync(source, _table);
+
+        await using var sharedSub = await SubscribeAsync(source, _table);
+
+        await InsertAsync(_table, "r1", "pending");
+        var r1Event = await WaitForAsync(sharedSub);
+
+        await using var resumedSub = await SubscribeAsync(source, _table, r1Event.Token);
+
+        await InsertAsync(_table, "r2", "pending");
+        await InsertAsync(_table, "r3", "pending");
+        await WaitForAsync(sharedSub);
+        await WaitForAsync(sharedSub);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+        Assert.Equal(3L, await CountChangesAsync(_table));
+
+        await resumedSub.DisposeAsync();
+        await Task.Delay(TimeSpan.FromMilliseconds(600));
+        Assert.Equal(1L, await CountChangesAsync(_table));
+    }
+
+    private async Task InstallTriggerAsync(IChangeSource source, string table)
+    {
+        await using var setup = await SubscribeAsync(source, table);
+        await setup.DisposeAsync();
+    }
+
+    private async Task<long> CountChangesAsync(string table)
+    {
+        await using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT count(*) FROM pulse._changes WHERE source = @source";
+        cmd.Parameters.AddWithValue("source", $"public.{table}");
+        var scalar = await cmd.ExecuteScalarAsync();
+        return Convert.ToInt64(scalar);
     }
 
     private async Task CreateOrdersTableAsync(string table)

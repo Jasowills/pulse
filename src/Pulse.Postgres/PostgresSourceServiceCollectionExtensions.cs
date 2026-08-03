@@ -17,6 +17,15 @@ public sealed class PostgresSourceOptions
     /// immediately in the common case, so this is only a robustness fallback.
     /// </summary>
     public TimeSpan PollInterval { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// How often the change-log pruning job runs. Pruning deletes rows below the minimum
+    /// sequence any live watcher can still reference (the oldest shared-watch start point
+    /// or resumed private watch token), so the log no longer grows unbounded while the
+    /// server is running. Rows for a source with no active watcher are never deleted, so
+    /// restart-resume tokens stay valid across outages.
+    /// </summary>
+    public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(1);
 }
 
 /// <summary>
@@ -45,6 +54,11 @@ public static class PostgresSourceServiceCollectionExtensions
             throw new ArgumentException("PostgresSourceOptions.PollInterval must be positive.", nameof(configure));
         }
 
+        if (options.PruneInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentException("PostgresSourceOptions.PruneInterval must be positive.", nameof(configure));
+        }
+
         services.AddSignalR();
         // Default resume store is in-memory (does not survive restarts — see README caveats).
         // Register IResumeTokenStore yourself before AddPostgresSource to override, e.g. FileResumeTokenStore.
@@ -53,7 +67,8 @@ public static class PostgresSourceServiceCollectionExtensions
         services.AddSingleton(sp => new PostgresChangeSource(
             sp.GetRequiredService<NpgsqlDataSource>(),
             sp.GetService<ILogger<PostgresChangeSource>>(),
-            options.PollInterval));
+            options.PollInterval,
+            options.PruneInterval));
         services.AddSingleton(sp => new SubscriptionRegistry(
             sp.GetRequiredService<PostgresChangeSource>(),
             sp.GetRequiredService<IHubContext<PulseHub>>(),
