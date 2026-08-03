@@ -214,7 +214,7 @@ public sealed class MongoChangeSource : IChangeSource
     {
         var cursor = await OpenCursorAsync(source, resumeFrom, cancellationToken).ConfigureAwait(false);
         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var loop = PumpAsync(cursor, source, onChange, cts.Token);
+        var loop = PumpAsync(cursor, source, onChange, onResumeToken: null, cts.Token);
         return new PrivateWatchHandle(cursor, cts, loop);
     }
 
@@ -245,6 +245,7 @@ public sealed class MongoChangeSource : IChangeSource
         IChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor,
         string source,
         Func<ChangeEvent, Task> onChange,
+        Action<BsonDocument>? onResumeToken,
         CancellationToken cancellationToken)
     {
         try
@@ -254,6 +255,11 @@ public sealed class MongoChangeSource : IChangeSource
                 foreach (var change in cursor.Current)
                 {
                     await onChange(ToChangeEvent(change, source)).ConfigureAwait(false);
+                }
+
+                if (onResumeToken is not null && TryGetResumeToken(cursor) is { } token)
+                {
+                    onResumeToken(token);
                 }
             }
         }
@@ -317,13 +323,20 @@ public sealed class MongoChangeSource : IChangeSource
         private readonly MongoChangeSource _owner;
         private readonly string _source;
         private readonly List<Func<ChangeEvent, Task>> _subscribers = new();
+        private readonly ILogger _logger;
         private CancellationTokenSource? _cts;
         private Task? _startTask;
+        private byte[]? _lastResumeToken;
+        private int _consecutiveFailures;
+        private int _staleRetries;
+
+        private const int MaxStaleRetries = 3;
 
         public SharedWatch(MongoChangeSource owner, string source)
         {
             _owner = owner;
             _source = source;
+            _logger = owner._logger;
         }
 
         public void AddSubscriber(Func<ChangeEvent, Task> onChange) => _subscribers.Add(onChange);
@@ -350,8 +363,8 @@ public sealed class MongoChangeSource : IChangeSource
         {
             try
             {
-                var cursor = await _owner.OpenCursorAsync(_source, null, cts.Token).ConfigureAwait(false);
-                _ = Task.Run(() => RunPumpAsync(cursor, cts.Token));
+                var cursor = await _owner.OpenCursorAsync(_source, ResumeFrom(), cts.Token).ConfigureAwait(false);
+                _ = Task.Run(() => RunSupervisedAsync(cursor, cts));
             }
             catch (Exception)
             {
@@ -364,18 +377,103 @@ public sealed class MongoChangeSource : IChangeSource
             }
         }
 
-        private async Task RunPumpAsync(
-            IChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor,
-            CancellationToken token)
+        /// <summary>
+        /// Runs the change stream and restarts it after a failure with capped exponential
+        /// backoff, resuming from the last seen resume token. A cursor that cannot resume from
+        /// its token (the oplog rolled off) falls back to a fresh stream after a few retries,
+        /// logging the gap, so transient outages don't permanently kill the shared watch.
+        /// </summary>
+        private async Task RunSupervisedAsync(
+            IChangeStreamCursor<ChangeStreamDocument<BsonDocument>>? initialCursor,
+            CancellationTokenSource cts)
+        {
+            var cursor = initialCursor;
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    if (cursor is null)
+                    {
+                        cursor = await _owner.OpenCursorAsync(_source, ResumeFrom(), cts.Token).ConfigureAwait(false);
+                    }
+
+                    await _owner.PumpAsync(cursor, _source, FanOutAsync, OnResumeToken, cts.Token).ConfigureAwait(false);
+                    return; // stream ended normally (e.g. an invalidate on collection drop)
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (ResumeTokenInvalidException)
+                {
+                    cursor = null;
+                    if (++_staleRetries >= MaxStaleRetries)
+                    {
+                        _logger.LogWarning(
+                            "Change stream for source '{Source}' cannot be resumed from its stored token; restarting from the current position. Events in the gap may be missed.",
+                            _source);
+                        lock (_owner._sync)
+                        {
+                            _lastResumeToken = null;
+                        }
+                    }
+
+                    if (!await DelayAsync(BackoffDelay(_consecutiveFailures++), cts.Token))
+                    {
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    cursor = null;
+                    if (!await DelayAsync(BackoffDelay(_consecutiveFailures++), cts.Token))
+                    {
+                        return;
+                    }
+
+                    _logger.LogError(ex, "Change stream for source '{Source}' failed; retrying.", _source);
+                }
+            }
+        }
+
+        private void OnResumeToken(BsonDocument token)
+        {
+            _consecutiveFailures = 0;
+            _staleRetries = 0;
+            lock (_owner._sync)
+            {
+                _lastResumeToken = MongoResumeTokenCodec.Encode(token);
+            }
+        }
+
+        private ResumeToken? ResumeFrom()
+        {
+            lock (_owner._sync)
+            {
+                return _lastResumeToken is { } opaque
+                    ? new ResumeToken(_owner.ProviderIdFor(_source), opaque)
+                    : null;
+            }
+        }
+
+        private static async Task<bool> DelayAsync(TimeSpan delay, CancellationToken token)
         {
             try
             {
-                await _owner.PumpAsync(cursor, _source, FanOutAsync, token).ConfigureAwait(false);
+                await Task.Delay(delay, token).ConfigureAwait(false);
+                return true;
             }
-            catch (Exception ex)
+            catch (OperationCanceledException)
             {
-                _owner._logger.LogError(ex, "Shared change stream for source '{Source}' failed.", _source);
+                return false;
             }
+        }
+
+        private static TimeSpan BackoffDelay(int failures)
+        {
+            var capped = Math.Min(failures, 6);
+            var ms = 250 * Math.Pow(2, capped);
+            return TimeSpan.FromMilliseconds(Math.Min(ms, 30000));
         }
 
         private async Task FanOutAsync(ChangeEvent change)
