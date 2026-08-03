@@ -1,12 +1,12 @@
 # Pulse
 
-**Firebase-style reactive queries and live sync, native to C#/.NET, for MongoDB and Postgres.**
+**Firebase-style reactive queries and live sync, native to C#/.NET, for MongoDB, Postgres, and SQL Server.**
 
-Pulse is a .NET package suite that lets clients subscribe to a query (source + filter), receive an initial snapshot of matching documents, and then stay in sync as the database changes — MongoDB change streams and Postgres triggers on the server, delivered to clients over SignalR.
+Pulse is a .NET package suite that lets clients subscribe to a query (source + filter), receive an initial snapshot of matching documents, and then stay in sync as the database changes — MongoDB change streams, Postgres triggers, and SQL Server change tracking on the server, delivered to clients over SignalR.
 
 Target framework: **.NET 8** (LTS, MAUI-compatible) for all projects.
 
-> **Status: v0.2 — Postgres provider shipped, SQL Server next.** The v0.1 MVP steps 0–9 are done: scaffold, `Pulse.Abstractions`, `Pulse.Mongo`'s change-stream `WatchAsync` (verified end-to-end against a real Testcontainers Mongo replica set), `Pulse.Server`'s `PulseHub` broadcast with shared per-source watches and `AddMongoSource`, server-side filter matching (`DictionaryFilterMatcher`), gap-free snapshot delivery on subscribe (`GetSnapshotAsync` with watch-first as-of token capture), resume-token persistence (`IResumeTokenStore`, in-memory + file-based, with stale-token resync verified across a server restart), the `Pulse.Client` SDK's `Subscribe<T>` (typed snapshot + live changes, `Current` cache, in-order message processing), automatic client reconnect with resubscribe-treats-as-fresh-snapshot, and match-transition handling (an update that flips a doc out of a filter becomes a synthetic delete; one that flips it in becomes an insert). v0.2 adds a second provider: `Pulse.Postgres` watches tables via triggers plus a `pulse._changes` log (single-column primary key required, `_id` = pk), with the same resume-token, snapshot, and match-transition semantics — verified end-to-end against a real Testcontainers Postgres. SQL Server is next. API shapes below are the design contract and will land in that order.
+> **Status: v0.3 — SQL Server provider shipped.** The v0.1 MVP steps 0–9 are done: scaffold, `Pulse.Abstractions`, `Pulse.Mongo`'s change-stream `WatchAsync` (verified end-to-end against a real Testcontainers Mongo replica set), `Pulse.Server`'s `PulseHub` broadcast with shared per-source watches and `AddMongoSource`, server-side filter matching (`DictionaryFilterMatcher`), gap-free snapshot delivery on subscribe (`GetSnapshotAsync` with watch-first as-of token capture), resume-token persistence (`IResumeTokenStore`, in-memory + file-based, with stale-token resync verified across a server restart), the `Pulse.Client` SDK's `Subscribe<T>` (typed snapshot + live changes, `Current` cache, in-order message processing), automatic client reconnect with resubscribe-treats-as-fresh-snapshot, and match-transition handling (an update that flips a doc out of a filter becomes a synthetic delete; one that flips it in becomes an insert). v0.2 adds a second provider: `Pulse.Postgres` watches tables via triggers plus a `pulse._changes` log (single-column primary key required, `_id` = pk), with the same resume-token, snapshot, and match-transition semantics — verified end-to-end against a real Testcontainers Postgres. v0.3 adds a third provider: `Pulse.SqlServer` watches tables via native **Change Tracking** (`CHANGETABLE(CHANGES ...)` + version-based resume tokens; single-column primary key required, `_id` = pk), verified end-to-end against a real Testcontainers SQL Server. API shapes below are the design contract and will land in that order.
 
 ---
 
@@ -23,6 +23,8 @@ Target framework: **.NET 8** (LTS, MAUI-compatible) for all projects.
 - [Client SDK](#client-sdk)
 - [Resume tokens and gapless delivery](#resume-tokens-and-gapless-delivery)
 - [Match-transition handling](#match-transition-handling)
+- [Postgres provider (v0.2)](#postgres-provider-v02)
+- [SQL Server provider (v0.3)](#sql-server-provider-v03)
 - [Important caveats](#important-caveats)
 - [Development](#development)
 - [Testing](#testing)
@@ -35,7 +37,7 @@ Target framework: **.NET 8** (LTS, MAUI-compatible) for all projects.
 
 Many C# apps end up polling the database to reflect state changes in the UI, or hand-rolling a pub/sub layer that drifts from the data. Pulse treats the database as the source of truth and pushes changes out, so a client's view stays correct without a query being re-run on every change.
 
-Pulse is designed to be **provider-agnostic from day one**: the core abstractions carry no database concepts, so the Postgres provider (v0.2) was added without touching the server hub, the subscription registry, or the client SDK, and SQL Server can slot in the same way.
+Pulse is designed to be **provider-agnostic from day one**: the core abstractions carry no database concepts, so the Postgres provider (v0.2) and the SQL Server provider (v0.3) were added without touching the server hub, the subscription registry, or the client SDK.
 
 ## Features
 
@@ -43,7 +45,7 @@ Pulse is designed to be **provider-agnostic from day one**: the core abstraction
 - **Snapshot + live diffs** — on subscribe, the client receives the current matching documents, then incremental changes.
 - **Resume-token persistence** — a server restart or brief outage does not silently drop events.
 - **Automatic reconnect + resubscribe** — handled by the client SDK.
-- **Multi-provider** — MongoDB (v0.1) and Postgres (v0.2) behind the same `IChangeSource` / `IFilterMatcher` seam; SQL Server planned.
+- **Multi-provider** — MongoDB (v0.1), Postgres (v0.2), and SQL Server (v0.3) behind the same `IChangeSource` / `IFilterMatcher` seam.
 - **Live list semantics** — updates that move a document in or out of a filter's match set are surfaced correctly (synthetic insert/remove to each affected subscriber).
 
 ## Non-goals for v0.1
@@ -52,7 +54,7 @@ These are explicitly deferred and **not built** in v0.1:
 
 - Offline-first sync / conflict resolution on mobile.
 - Auth/authorization framework (v0.1 exposes the `IPulseAuthorizer` seam only; the default allows everything — see [Important caveats](#important-caveats)).
-- Multi-database support (Mongo only for v0.1, Postgres added in v0.2; the interfaces must not leak provider-specific concepts).
+- Multi-database support (Mongo only for v0.1, Postgres added in v0.2, SQL Server in v0.3; the interfaces must not leak provider-specific concepts).
 - Horizontal scale-out across multiple server instances.
 - Arbitrary pub/sub / message-queue behavior — this is DB-state-change subscription only.
 
@@ -64,7 +66,10 @@ These are explicitly deferred and **not built** in v0.1:
   Mongo (change streams) ──┐
                           ├─ IChangeSource.WatchAsync / GetSnapshotAsync
   Postgres (triggers +     │
-    pulse._changes log) ───┘
+    pulse._changes log) ───┼─┐
+                          │ │
+  SQL Server (change      ┘ │
+    tracking) ──────────────┘
         ▼
   Pulse.Server  ──  SubscriptionRegistry (match-transition detection, resume tokens)
         │  SignalR Hub  /pulse
@@ -86,23 +91,25 @@ These are explicitly deferred and **not built** in v0.1:
   Pulse.Server/              SignalR hub, subscription registry, match engine, hosting extensions
   Pulse.Mongo/               MongoChangeSource : IChangeSource, Mongo resume-token codec
   Pulse.Postgres/            PostgresChangeSource : IChangeSource (triggers + _changes log), PostgresFilterTranslator
+  Pulse.SqlServer/           SqlServerChangeSource : IChangeSource (change tracking), SqlServerFilterTranslator
   Pulse.Client/              PulseClient SDK (ASP.NET, desktop, MAUI)
 /tests
   Pulse.Server.Tests/
   Pulse.Mongo.Tests/         real Mongo via Testcontainers
   Pulse.Postgres.Tests/      real Postgres via Testcontainers
+  Pulse.SqlServer.Tests/     real SQL Server via Testcontainers
   Pulse.Client.Tests/
-  Pulse.Integration.Tests/   end-to-end: Testcontainers Mongo/Postgres + in-process SignalR + real PulseClient
+  Pulse.Integration.Tests/   end-to-end: Testcontainers Mongo/Postgres/SQL Server + in-process SignalR + real PulseClient
 /samples
   Pulse.Sample.Server/       ASP.NET Core minimal API host wiring Pulse in
   Pulse.Sample.MauiClient/   MAUI app (deferred until build step 10)
 ```
 
-NuGet package IDs: `Pulse.Abstractions`, `Pulse.Server`, `Pulse.Mongo`, `Pulse.Postgres`, `Pulse.Client`.
+NuGet package IDs: `Pulse.Abstractions`, `Pulse.Server`, `Pulse.Mongo`, `Pulse.Postgres`, `Pulse.SqlServer`, `Pulse.Client`.
 
 ## Filter DSL
 
-Subscriptions use a small, provider-neutral expression tree — **not** raw MongoDB query syntax — so it maps cleanly onto both a BSON document (Mongo) and a SQL row (Postgres/SQL Server later).
+Subscriptions use a small, provider-neutral expression tree — **not** raw MongoDB query syntax — so it maps cleanly onto a BSON document (Mongo), a JSON document (Postgres), and a SQL row (SQL Server).
 
 ```json
 {
@@ -154,6 +161,12 @@ builder.Services.AddMongoSource(options =>
 builder.Services.AddPostgresSource(options =>
 {
     options.ConnectionString = postgresConnectionString;
+});
+
+// SQL Server provider (change tracking)
+builder.Services.AddSqlServerSource(options =>
+{
+    options.ConnectionString = sqlServerConnectionString;
 });
 
 var app = builder.Build();
@@ -221,6 +234,23 @@ Caveats specific to Postgres:
 - **Filter paths are JSON paths.** Filters navigate `to_jsonb(row)` with jsonb `#>`/`#>>`, so dotted paths (`customer.address.city`) and array indexes work, and comparisons preserve JSON types (a number field never equals a string filter value). Range comparisons require numeric or string filter values.
 - **The change log grows unbounded** in v0.2 (no pruning). A cleanup job that deletes rows below the minimum active resume token is planned.
 
+## SQL Server provider (v0.3)
+
+`Pulse.SqlServer` implements the same `IChangeSource` contract on top of SQL Server **Change Tracking**:
+
+- **Native change tracking.** On first subscribe, the provider runs `ALTER DATABASE SET CHANGE_TRACKING = ON` (best-effort — it errors clearly if the login lacks permission) and `ALTER TABLE ... ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON)` per table. Watchers poll `CHANGETABLE(CHANGES schema.table, @version)` in 250 ms intervals; there is no trigger or change-log table of our own.
+- **`_id` = the primary key.** Each row is delivered with its single-column primary key exposed as `_id`. A table with no primary key or a composite primary key is rejected at subscribe time with an actionable error. Sources are resolved as `schema.table`; a bare table name defaults to `dbo`. `ProviderIdFor` is `sqlserver:{schema}.{table}`.
+- **Snapshot + resume tokens.** `GetSnapshotAsync` captures `CHANGE_TRACKING_CURRENT_VERSION()` *before* the snapshot query (watch-first), so live watching picks up without a gap or duplicate. A resume token is the 8-byte big-endian version; a token that points past the current version, belongs to a different provider, or has been cleaned up by retention (`22119` / `22122`) is rejected as stale via `ResumeTokenInvalidException`.
+- **Change kinds.** SQL Server emits `insert`, `update`, and `delete` (no `replace`). Updates carry the changed columns in `updated_fields`, decoded from the per-row `SYS_CHANGE_COLUMNS` mask via `CHANGE_TRACKING_IS_COLUMN_IN_MASK`.
+- **JSON columns.** `nvarchar`/`varchar` columns that hold a valid JSON object or array are embedded as nested documents (mirroring `jsonb` on Postgres); plain text stays a string.
+
+Caveats specific to SQL Server:
+
+- **Writes before the first subscription are not captured.** Change tracking starts the moment the table is enabled; earlier writes are simply not in the change set (the subscribe-time snapshot covers them, taken from the live table).
+- **The primary key must be single-column and immutable.** Change tracking records row keys, not full rows, so a row whose PK changes reads as a delete + insert. Decimal PKs are compared by exact byte value; other decimal fields still compare as doubles (a caveat shared with Postgres).
+- **Filter paths are JSON paths.** Filters navigate the first segment as a real column and any remaining segments via `JSON_VALUE` inside it, so dotted paths (`customer.address.city`) work on JSON columns, with numeric range comparisons via `TRY_CONVERT(decimal(38,18), ...)`. `_id` maps to the primary key column.
+- **No `LIMIT`/`BIGSERIAL`/`RETURNING`.** Snapshot and change queries use `TOP`-free ordered reads; tables need a `bigint identity` (or similar) for numeric `_id` columns.
+
 ## Important caveats
 
 Read these before using Pulse in anything beyond a prototype.
@@ -236,14 +266,14 @@ Read these before using Pulse in anything beyond a prototype.
 Prerequisites:
 
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) (pinned in `global.json`)
-- [Docker](https://www.docker.com/products/docker-desktop/) (Docker Desktop or any Docker daemon) — required for the Testcontainers-based Mongo and Postgres tests
+- [Docker](https://www.docker.com/products/docker-desktop/) (Docker Desktop or any Docker daemon) — required for the Testcontainers-based Mongo, Postgres, and SQL Server tests
 - A shell with `dotnet` on `PATH` (Homebrew `dotnet@8` is keg-only: `export PATH="/usr/local/opt/dotnet@8/bin:$PATH"`)
 
 Commands:
 
 ```bash
 dotnet build Pulse.sln          # build everything
-dotnet test Pulse.sln           # run all test suites (spins up Mongo + Postgres via Testcontainers)
+dotnet test Pulse.sln           # run all test suites (spins up Mongo + Postgres + SQL Server via Testcontainers)
 dotnet run --project samples/Pulse.Sample.Server   # run the sample server
 ```
 
@@ -255,8 +285,9 @@ Solution-wide settings (target framework, nullability, lang version) live in `Di
 - `Pulse.Server` — `DictionaryFilterMatcher` against a table of documents/filters/expected results (all operators, nested paths); registry match-transition logic with a mocked `IChangeSource`.
 - `Pulse.Mongo` — a real Mongo instance via `Testcontainers.MongoDb` (change streams are not mocked): insert/update/delete detection, resume-after-token continuation, invalid-token exception path, snapshot-then-watch gap-free behavior.
 - `Pulse.Postgres` — a real Postgres instance via `Testcontainers.PostgreSql` (triggers and NOTIFY are not mocked): insert/update/delete detection with changed-field diffs, shared-watch fan-out, resume-after-token continuation, filtered snapshots (nested + arithmetic), composite/no-primary-key rejection, snapshot-then-watch gap-free behavior.
+- `Pulse.SqlServer` — a real SQL Server instance via `Testcontainers.MsSql` (change tracking is not mocked): insert/update/delete detection with changed-field masks, shared-watch fan-out, resume-after-token continuation, filtered snapshots (nested + arithmetic), composite/no-primary-key/missing-table rejection, stale-token rejection, snapshot-then-watch gap-free behavior.
 - `Pulse.Client` — reconnect/resubscribe against an in-process test SignalR server.
-- `Pulse.Integration.Tests` — end-to-end: real Mongo/Postgres + in-process SignalR hub + real `PulseClient`; subscribe, snapshot, mutate the database directly, assert the change arrives client-side; kill and restart the connection and assert resubscribe; restart the server with a file-backed resume token and assert no-gap resume.
+- `Pulse.Integration.Tests` — end-to-end: real Mongo/Postgres/SQL Server + in-process SignalR hub + real `PulseClient`; subscribe, snapshot, mutate the database directly, assert the change arrives client-side; kill and restart the connection and assert resubscribe; restart the server with a file-backed resume token and assert no-gap resume.
 
 ## Build status
 
@@ -284,12 +315,20 @@ The v0.1 implementation follows this order — each step is independently demoab
 | 2 | Postgres `GetSnapshotAsync` + `PostgresFilterTranslator` (jsonb WHERE), composite/no-PK rejection | Done |
 | 3 | `AddPostgresSource` DI extension | Done |
 | 4 | Postgres unit + end-to-end tests (Testcontainers, restart-resume) | Done |
-| 5 | `Pulse.SqlServer` provider (change tracking / triggers) | Pending |
+| 5 | `Pulse.SqlServer` provider (change tracking) | Done |
+
+**v0.3 — third provider:**
+
+| # | Step | Status |
+|---|---|---|
+| 1 | `Pulse.SqlServer` provider: change tracking bootstrap, `CHANGETABLE(CHANGES ...)` pump, shared watches, version resume tokens | Done |
+| 2 | SQL Server `GetSnapshotAsync` + `SqlServerFilterTranslator` (JSON_VALUE WHERE), composite/no-PK rejection | Done |
+| 3 | `AddSqlServerSource` DI extension | Done |
+| 4 | SQL Server unit + end-to-end tests (Testcontainers, restart-resume) | Done |
 
 ## Roadmap / explicitly deferred
 
 - **Horizontal scale-out** — multiple server instances sharing subscription state. SignalR already supports a Redis backplane for connection fan-out; filter state and match-transition tracking would need to be shared/sharded too. The registry is structured so this is a non-breaking addition.
-- **SQL Server provider** — additive via `IChangeSource` / `IFilterMatcher` / `IResumeTokenStore`; the shipped Postgres provider is the reference implementation to mirror.
 - **Offline queue / conflict resolution** for mobile clients.
 - **Row-level authorization** beyond the `IPulseAuthorizer` seam.
 - **Richer filter DSL** — array-element matching, full-text search, etc. (v2).
