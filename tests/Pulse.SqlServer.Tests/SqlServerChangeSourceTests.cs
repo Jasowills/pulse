@@ -202,6 +202,37 @@ public sealed class SqlServerChangeSourceTests : IClassFixture<SqlServerContaine
     }
 
     [Fact]
+    public async Task SharedWatch_RecoversAfterPumpFailure_AndResumesFromLastDelivered()
+    {
+        await using var sub = await SubscribeAsync(_source, _table);
+
+        await InsertAsync(_table, "a", "pending");
+        var e1 = await WaitForAsync(sub);
+        Assert.Equal("a", e1.DocumentId);
+
+        // Force the poller to fault: while change tracking is disabled on the table,
+        // CHANGETABLE throws, which must not kill the shared watch. Give the pump time to
+        // poll (50 ms interval) and hit the disabled state at least once.
+        await using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"ALTER TABLE [dbo].[{_table}] DISABLE CHANGE_TRACKING";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        await Task.Delay(TimeSpan.FromMilliseconds(400));
+
+        await using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"ALTER TABLE [dbo].[{_table}] ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON)";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        await InsertAsync(_table, "b", "recovered");
+        var e2 = await WaitForAsync(sub);
+        Assert.Equal("b", e2.DocumentId);
+    }
+
+    [Fact]
     public async Task SeparateTables_AreIsolated()
     {
         var other = _table + "_b";

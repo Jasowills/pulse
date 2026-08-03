@@ -176,6 +176,8 @@ app.Run();
 
 `AddXxxSource()` is provider-specific and registers its own `SubscriptionRegistry`, `IResumeTokenStore` (in-memory by default), and change source; nothing in `Pulse.Server` references a concrete provider. A server typically wires a single provider — multiple registries route by `CanHandle`, which defaults to claiming every source.
 
+Shared per-source watchers are resilient to transient failures: if the underlying poller faults (a dropped connection, change-tracking cleanup, a missed NOTIFY), it restarts with capped exponential backoff and resumes from the last delivered resume point, so a momentary database blip doesn't permanently stop delivery. Private resumed watches surface the same fault through their `Completion` task.
+
 Authorization is an extension point, not a system: implement `IPulseAuthorizer` and register it. See the caveat below — the default allows everything.
 
 ## Client SDK

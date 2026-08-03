@@ -441,7 +441,7 @@ public sealed class PostgresChangeSource : IChangeSource
         }
 
         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var loop = PumpAsync(source, resolved, onChange, seq, cts.Token);
+        var loop = PumpAsync(source, resolved, onChange, seq, onSynced: null, cts.Token);
         return new PrivateWatchHandle(cts, loop);
     }
 
@@ -491,6 +491,7 @@ public sealed class PostgresChangeSource : IChangeSource
         string resolved,
         Func<ChangeEvent, Task> onChange,
         long lastSeq,
+        Action<long>? onSynced,
         CancellationToken cancellationToken)
     {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -510,27 +511,8 @@ public sealed class PostgresChangeSource : IChangeSource
                 lastSeq = seq;
             }
 
+            onSynced?.Invoke(lastSeq);
             await WaitForSignalAsync(connection, cancellationToken).ConfigureAwait(false);
-        }
-    }
-
-    private async Task RunPumpAsync(
-        string source,
-        string resolved,
-        Func<ChangeEvent, Task> onChange,
-        long lastSeq,
-        CancellationToken token)
-    {
-        try
-        {
-            await PumpAsync(source, resolved, onChange, lastSeq, token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Change watch for source '{Source}' failed.", source);
         }
     }
 
@@ -595,14 +577,20 @@ public sealed class PostgresChangeSource : IChangeSource
         private readonly string _source;
         private readonly string _resolved;
         private readonly List<Func<ChangeEvent, Task>> _subscribers = new();
+        private readonly ILogger _logger;
+        private readonly TimeSpan _pollInterval;
         private CancellationTokenSource? _cts;
         private Task? _startTask;
+        private long _lastSeq;
+        private int _consecutiveFailures;
 
         public SharedWatch(PostgresChangeSource owner, string source)
         {
             _owner = owner;
             _source = source;
             _resolved = ResolvedSource(source);
+            _logger = owner._logger;
+            _pollInterval = owner._pollInterval;
         }
 
         public void AddSubscriber(Func<ChangeEvent, Task> onChange) => _subscribers.Add(onChange);
@@ -629,8 +617,8 @@ public sealed class PostgresChangeSource : IChangeSource
         {
             try
             {
-                var initialSeq = await _owner.GetCurrentMaxSeqAsync(_resolved, cts.Token).ConfigureAwait(false);
-                _ = Task.Run(() => _owner.RunPumpAsync(_source, _resolved, FanOutAsync, initialSeq, cts.Token));
+                _lastSeq = await _owner.GetCurrentMaxSeqAsync(_resolved, cts.Token).ConfigureAwait(false);
+                _ = Task.Run(() => RunSupervisedAsync(cts));
             }
             catch (Exception)
             {
@@ -641,6 +629,61 @@ public sealed class PostgresChangeSource : IChangeSource
 
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Runs the poller and restarts it after a failure with capped exponential backoff,
+        /// resuming from the last successfully delivered sequence so transient outages (a
+        /// dropped connection, missed NOTIFY) don't permanently kill the watch.
+        /// </summary>
+        private async Task RunSupervisedAsync(CancellationTokenSource cts)
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    await _owner.PumpAsync(_source, _resolved, FanOutAsync, _lastSeq, OnSynced, cts.Token)
+                        .ConfigureAwait(false);
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    var delay = BackoffDelay(_consecutiveFailures++);
+                    _logger.LogError(
+                        ex,
+                        "Change watch for source '{Source}' failed; retrying in {Delay} ms.",
+                        _source,
+                        (int)delay.TotalMilliseconds);
+                    try
+                    {
+                        await Task.Delay(delay, cts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        private void OnSynced(long seq)
+        {
+            _consecutiveFailures = 0;
+            lock (_owner._sync)
+            {
+                _lastSeq = seq;
+            }
+        }
+
+        private TimeSpan BackoffDelay(int failures)
+        {
+            var capped = Math.Min(failures, 6);
+            var ms = _pollInterval.TotalMilliseconds * Math.Pow(2, capped);
+            return TimeSpan.FromMilliseconds(Math.Min(ms, 30000));
         }
 
         private async Task FanOutAsync(ChangeEvent change)
