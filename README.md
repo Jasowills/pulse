@@ -250,6 +250,7 @@ Caveats specific to SQL Server:
 - **The primary key must be single-column and immutable.** Change tracking records row keys, not full rows, so a row whose PK changes reads as a delete + insert. Decimal PKs are compared by exact byte value; other decimal fields still compare as doubles (a caveat shared with Postgres).
 - **Filter paths are JSON paths.** Filters navigate the first segment as a real column and any remaining segments via `JSON_VALUE` inside it, so dotted paths (`customer.address.city`) work on JSON columns, with numeric range comparisons via `TRY_CONVERT(decimal(38,18), ...)`. `_id` maps to the primary key column.
 - **No `LIMIT`/`BIGSERIAL`/`RETURNING`.** Snapshot and change queries use `TOP`-free ordered reads; tables need a `bigint identity` (or similar) for numeric `_id` columns.
+- **`updated_fields` is unavailable on two-column tables.** SQL Server reports `SYS_CHANGE_COLUMNS = NULL` for updates on tables with only a primary key and one other column, so Pulse cannot report which field changed there (the change event itself is still correct). Tables with three or more columns decode `updated_fields` normally.
 
 ## Important caveats
 

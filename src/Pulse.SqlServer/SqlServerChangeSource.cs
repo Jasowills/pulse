@@ -216,15 +216,25 @@ public sealed class SqlServerChangeSource : IChangeSource
             return;
         }
 
-        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var check = connection.CreateCommand();
-        check.CommandText = "SELECT COUNT(*) FROM sys.change_tracking_databases WHERE database_id = DB_ID()";
-        var enabled = Convert.ToInt32(await check.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
-        if (enabled == 0)
+        try
         {
-            await using var command = connection.CreateCommand();
-            command.CommandText = $"ALTER DATABASE {QuoteIdent(_databaseName)} SET CHANGE_TRACKING = ON";
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var check = connection.CreateCommand();
+            check.CommandText = "SELECT COUNT(*) FROM sys.change_tracking_databases WHERE database_id = DB_ID()";
+            var enabled = Convert.ToInt32(await check.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
+            if (enabled == 0)
+            {
+                await using var command = connection.CreateCommand();
+                command.CommandText = $"ALTER DATABASE {QuoteIdent(_databaseName)} SET CHANGE_TRACKING = ON";
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // Reset so a transient/permission failure retries on the next call instead of
+            // permanently short-circuiting bootstrap.
+            Interlocked.Exchange(ref _dbBootstrapped, 0);
+            throw;
         }
     }
 
@@ -433,7 +443,9 @@ public sealed class SqlServerChangeSource : IChangeSource
         byte[] mask,
         CancellationToken cancellationToken)
     {
-        var key = Convert.ToHexString(mask);
+        // Masks are bitmaps over the table's own column ordinals, so the same bits decode to
+        // different names on different tables — the cache key must be scoped to the table.
+        var key = $"{resolved}|{Convert.ToHexString(mask)}";
         lock (_sync)
         {
             if (_maskCache.TryGetValue(key, out var cached))

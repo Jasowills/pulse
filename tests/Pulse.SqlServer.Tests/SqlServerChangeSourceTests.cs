@@ -115,6 +115,57 @@ public sealed class SqlServerChangeSourceTests : IClassFixture<SqlServerContaine
     }
 
     [Fact]
+    public async Task UpdatedFields_MaskCache_IsScopedPerTable()
+    {
+        // Two tables whose updated column sits at the same column_id produce an identical
+        // change-tracking mask (a bitmap over the table's own ordinals), so the decode cache
+        // must be keyed per table — otherwise the second table gains the first table's names.
+        var first = _table; // orders: column 2 = "status"
+        var second = "staff_" + Guid.NewGuid().ToString("N");
+        await CreateTableAsync($"""
+            CREATE TABLE [{second}] (
+                id nvarchar(50) NOT NULL PRIMARY KEY,
+                rank nvarchar(50) NOT NULL,
+                active bit NOT NULL
+            )
+            """);
+
+        // Writes before subscribing are not tracked (change tracking starts at subscribe), so
+        // each table produces a single net update event with a decodable column mask. The
+        // staff table needs a third column: SQL Server emits SYS_CHANGE_COLUMNS = NULL for
+        // updates on two-column (PK + one) tables, so no mask would be decodable.
+        await InsertAsync(first, "o", "pending", 42);
+        await using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"INSERT INTO [{second}] (id, rank, active) VALUES (@id, @rank, @active)";
+            cmd.Parameters.AddWithValue("@id", "s");
+            cmd.Parameters.AddWithValue("@rank", "lieutenant");
+            cmd.Parameters.Add("@active", SqlDbType.Bit).Value = true;
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        await using var ordersSub = await SubscribeAsync(_source, first);
+        await using var staffSub = await SubscribeAsync(_source, second);
+
+        await UpdateAsync(first, "o", status: "shipped");
+        await using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"UPDATE [{second}] SET rank = @rank WHERE id = @id";
+            cmd.Parameters.AddWithValue("@id", "s");
+            cmd.Parameters.AddWithValue("@rank", "captain");
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        var ordersChange = await WaitForAsync(ordersSub);
+        Assert.Equal(ChangeKind.Update, ordersChange.Kind);
+        Assert.Equal("status", Assert.Single(ordersChange.UpdatedFields!).Key);
+
+        var staffChange = await WaitForAsync(staffSub);
+        Assert.Equal(ChangeKind.Update, staffChange.Kind);
+        Assert.Equal("rank", Assert.Single(staffChange.UpdatedFields!).Key);
+    }
+
+    [Fact]
     public async Task Delete_PublishesDelete_WithoutFullDocument()
     {
         await InsertAsync(_table, "a", "pending");
