@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:viewModels="clr-namespace:Pulse.TestApp.ViewModels"
+             x:Class="Pulse.TestApp.DetailPage"
+             x:DataType="viewModels:DetailViewModel"
+             Title="{Binding Title}">
+
+    <VerticalStackLayout Padding="20" Spacing="12">
+
+        <Label Text="{Binding Row.CustomerName}" FontSize="24" FontAttributes="Bold" />
+        <Label Text="{Binding Row.Status}" FontSize="18" TextColor="{StaticResource Secondary}" />
+        <Label Text="{Binding Row.Region, StringFormat='Region: {0}'}" />
+        <Label Text="{Binding Row.Total, StringFormat='Total: {0}'}" />
+        <Label Text="{Binding Row.Items, StringFormat='Items: {0}'}" />
+        <Label Text="{Binding Row.CreatedAt, StringFormat='Created: {0:g}'}" FontSize="12" TextColor="Gray" />
+        <Label Text="{Binding Row.Id, StringFormat='ID: {0}'}" FontSize="11" TextColor="Gray" />
+
+        <Label Text="Live — updates in place as status changes." FontSize="12" TextColor="Gray" Margin="0,24,0,0" />
+    </VerticalStackLayout>
+
+</ContentPage>

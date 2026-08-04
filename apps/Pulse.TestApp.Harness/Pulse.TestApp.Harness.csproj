@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Pulse.TestApp.Harness</AssemblyName>
+    <RootNamespace>Pulse.TestApp.Harness</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Pulse.Abstractions\Pulse.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\Pulse.Client\Pulse.Client.csproj" />
+    <ProjectReference Include="..\Pulse.TestApp.Core\Pulse.TestApp.Core.csproj" />
+  </ItemGroup>
+
+</Project>

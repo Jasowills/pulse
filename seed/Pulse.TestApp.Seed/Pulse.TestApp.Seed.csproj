@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Pulse.TestApp.Seed</AssemblyName>
+    <RootNamespace>Pulse.TestApp.Seed</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\apps\Pulse.TestApp.Core\Pulse.TestApp.Core.csproj" />
+  </ItemGroup>
+
+</Project>

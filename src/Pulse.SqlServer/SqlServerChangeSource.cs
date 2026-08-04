@@ -677,6 +677,10 @@ public sealed class SqlServerChangeSource : IChangeSource
             decimal dec => NormalizeNumber(dec),
             double dbl => NormalizeNumber(dbl),
             float flt => NormalizeNumber(flt),
+            // uniqueidentifier cells (including the _id / primary key) surface as their string
+            // form, matching how JSON serializes them and how every provider's _id is a string
+            // in memory — otherwise _id filters never match live change events.
+            Guid g => g.ToString(),
             _ => value,
         };
     }

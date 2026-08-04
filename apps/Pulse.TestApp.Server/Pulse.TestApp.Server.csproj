@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <RootNamespace>Pulse.TestApp.Server</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Pulse.Abstractions\Pulse.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\Pulse.Server\Pulse.Server.csproj" />
+    <ProjectReference Include="..\..\src\Pulse.Mongo\Pulse.Mongo.csproj" />
+    <ProjectReference Include="..\..\src\Pulse.Postgres\Pulse.Postgres.csproj" />
+    <ProjectReference Include="..\..\src\Pulse.SqlServer\Pulse.SqlServer.csproj" />
+    <ProjectReference Include="..\Pulse.TestApp.Core\Pulse.TestApp.Core.csproj" />
+  </ItemGroup>
+
+</Project>

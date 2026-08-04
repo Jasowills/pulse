@@ -43,7 +43,7 @@ public static class MongoSourceServiceCollectionExtensions
         // Default resume store is in-memory (does not survive restarts — see README caveats).
         // Register IResumeTokenStore yourself before AddMongoSource to override, e.g. FileResumeTokenStore.
         services.TryAddSingleton<IResumeTokenStore, InMemoryResumeTokenStore>();
-        services.AddSingleton(new MongoClient(MongoClientSettings.FromConnectionString(options.ConnectionString)));
+        services.AddSingleton<IMongoClient>(new MongoClient(MongoClientSettings.FromConnectionString(options.ConnectionString)));
         services.AddSingleton(sp => new MongoChangeSource(
             sp.GetRequiredService<IMongoClient>().GetDatabase(options.Database),
             sp.GetService<ILogger<MongoChangeSource>>()));

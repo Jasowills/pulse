@@ -50,7 +50,8 @@ public static class MongoFilterTranslator
         }
 
         var field = compare.Field;
-        var value = ToBsonValue(compare.Value);
+        var isId = field.Equals("_id", StringComparison.Ordinal);
+        var value = isId ? NormalizeId(ToBsonValue(compare.Value)) : ToBsonValue(compare.Value);
 
         return compare.Op switch
         {
@@ -69,6 +70,20 @@ public static class MongoFilterTranslator
             _ => throw new NotSupportedException($"Unsupported comparison operator '{compare.Op}'."),
         };
     }
+
+    /// <summary>
+    /// _id filters arrive as strings (Pulse surfaces ObjectIds as hex), but the stored value is
+    /// an ObjectId. Parse valid hex back to ObjectId so Eq/In on _id actually match.
+    /// </summary>
+    private static BsonValue NormalizeId(BsonValue value)
+        => value is BsonArray array
+            ? new BsonArray(array.Select(AsObjectId))
+            : AsObjectId(value);
+
+    private static BsonValue AsObjectId(BsonValue value)
+        => value is BsonString { Value: { } text } && ObjectId.TryParse(text, out var oid)
+            ? new BsonObjectId(oid)
+            : value;
 
     private static IEnumerable<BsonValue> AsArray(BsonValue value)
         => value is BsonArray array
