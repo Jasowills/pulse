@@ -31,6 +31,12 @@ public sealed class PulseClient : IAsyncDisposable
     /// <summary>Raised when the connection has fully closed (final failure or manual stop).</summary>
     public event Func<Exception?, Task>? OnDisconnected;
 
+    /// <summary>Raised when the client starts automatic reconnect attempts.</summary>
+    public event Func<Exception?, Task>? OnReconnecting;
+
+    /// <summary>Raised after a successful automatic reconnect (before subscription resync).</summary>
+    public event Func<string?, Task>? OnReconnected;
+
     public PulseClient(
         string hubUrl,
         Action<HttpConnectionOptions>? configureHttpConnection = null,
@@ -51,6 +57,7 @@ public sealed class PulseClient : IAsyncDisposable
         _connection.On<PulseSnapshotMessage>("PulseSnapshot", Dispatch);
         _connection.On<PulseChangeMessage>("PulseChange", Dispatch);
         _connection.Closed += OnClosedAsync;
+        _connection.Reconnecting += OnReconnectingAsync;
         _connection.Reconnected += OnReconnectedAsync;
     }
 
@@ -178,13 +185,26 @@ public sealed class PulseClient : IAsyncDisposable
         }
     }
 
+    private async Task OnReconnectingAsync(Exception? exception)
+    {
+        if (OnReconnecting is { } handler)
+        {
+            await handler(exception).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>
     /// After a reconnect the server no longer knows our subscription ids, so every active
     /// subscription is re-created. The result is treated as a fresh snapshot: the cached
     /// <c>Current</c> is cleared and <c>OnSnapshot</c> fires again with the new documents.
     /// </summary>
-    private async Task OnReconnectedAsync(string? _)
+    private async Task OnReconnectedAsync(string? connectionId)
     {
+        if (OnReconnected is { } handler)
+        {
+            await handler(connectionId).ConfigureAwait(false);
+        }
+
         IPulseSubscriptionHost[] subscriptions;
         lock (_sync)
         {

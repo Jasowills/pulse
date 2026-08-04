@@ -31,6 +31,16 @@ public sealed class PulseService : IAsyncDisposable
                 ConnectionStateChanged?.Invoke(State);
                 return Task.CompletedTask;
             };
+            _client.OnReconnecting += exc =>
+            {
+                ConnectionStateChanged?.Invoke(State);
+                return Task.CompletedTask;
+            };
+            _client.OnReconnected += _ =>
+            {
+                ConnectionStateChanged?.Invoke(State);
+                return Task.CompletedTask;
+            };
         }
 
         await _client.ConnectAsync();
