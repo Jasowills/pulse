@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 using Pulse.Abstractions;
+using Pulse.Server;
 
 namespace Pulse.Postgres;
 
@@ -109,15 +110,10 @@ public sealed class PostgresChangeSource : IChangeSource
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _pruneInterval;
     private readonly object _sync = new();
-    private readonly Dictionary<string, SharedWatch> _sharedWatches = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _pkColumns = new(StringComparer.Ordinal);
-
-    /// <summary>Active watcher floors keyed by resolved source, then by unique watcher id. Pruning never deletes a row a live watcher could still reference.</summary>
-    private readonly Dictionary<string, Dictionary<long, long>> _positions = new(StringComparer.Ordinal);
-    private long _nextWatcherId;
-    private CancellationTokenSource? _pruneCts;
-    private Task? _pruneTask;
     private int _bootstrapped;
+    private readonly SharedWatchCoordinator _coordinator;
+    private readonly PostgresAdapter _adapter;
 
     public PostgresChangeSource(
         NpgsqlDataSource dataSource,
@@ -129,6 +125,15 @@ public sealed class PostgresChangeSource : IChangeSource
         _logger = logger ?? NullLogger<PostgresChangeSource>.Instance;
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(250);
         _pruneInterval = pruneInterval ?? TimeSpan.FromMinutes(1);
+        _adapter = new PostgresAdapter(_dataSource, _pollInterval);
+        _coordinator = new SharedWatchCoordinator(
+            _adapter,
+            new SharedWatchCoordinatorOptions
+            {
+                PollInterval = _pollInterval,
+                MaxBackoff = TimeSpan.FromSeconds(30),
+                MaxStaleRetries = 3,
+            });
     }
 
     public string ProviderIdFor(string source)
@@ -155,13 +160,14 @@ public sealed class PostgresChangeSource : IChangeSource
 
         await EnsureSourceAsync(source, cancellationToken).ConfigureAwait(false);
 
+        var resolved = ResolvedSource(source);
         if (resumeFrom is not null)
         {
             ValidateProviderId(source, resumeFrom);
-            return await OpenPrivateWatchAsync(source, onChange, resumeFrom, cancellationToken).ConfigureAwait(false);
+            return await _coordinator.SubscribeResumedAsync(resolved, resumeFrom, onChange, cancellationToken).ConfigureAwait(false);
         }
 
-        return await RegisterSharedAsync(source, onChange, cancellationToken).ConfigureAwait(false);
+        return await _coordinator.SubscribeAsync(resolved, onChange, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<(IReadOnlyList<IReadOnlyDictionary<string, object?>> Documents, ResumeToken AsOf)>
@@ -423,130 +429,7 @@ public sealed class PostgresChangeSource : IChangeSource
         return changes;
     }
 
-    private void ValidateProviderId(string source, ResumeToken resumeFrom)
-    {
-        var expected = ProviderIdFor(source);
-        if (!string.Equals(resumeFrom.ProviderId, expected, StringComparison.Ordinal))
-        {
-            throw new ResumeTokenInvalidException(
-                $"Resume token was issued by '{resumeFrom.ProviderId}', but watching '{expected}'. Refusing to misinterpret the token.");
-        }
-    }
-
-    private async Task<IAsyncDisposable> OpenPrivateWatchAsync(
-        string source,
-        Func<ChangeEvent, Task> onChange,
-        ResumeToken resumeFrom,
-        CancellationToken cancellationToken)
-    {
-        var resolved = ResolvedSource(source);
-        var seq = DecodeSeq(resumeFrom.Opaque);
-
-        var maxSeq = await GetCurrentMaxSeqAsync(resolved, cancellationToken).ConfigureAwait(false);
-        if (seq > maxSeq)
-        {
-            throw new ResumeTokenInvalidException(
-                $"Resume token for '{ProviderIdFor(source)}' points past the current change log (seq {seq} > current {maxSeq}). The token is stale or was issued against a different database; refusing to resume from it.");
-        }
-
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var loop = PumpAsync(source, resolved, onChange, seq, onSynced: null, cts.Token);
-        var watcherId = NextWatcherId();
-        AddPosition(resolved, watcherId, seq);
-        return new PrivateWatchHandle(this, resolved, watcherId, cts, loop);
-    }
-
-    /// <summary>Registers a callback on a shared per-source watcher, creating it on first use.</summary>
-    private async Task<IAsyncDisposable> RegisterSharedAsync(
-        string source,
-        Func<ChangeEvent, Task> onChange,
-        CancellationToken cancellationToken)
-    {
-        SharedWatch shared;
-        lock (_sync)
-        {
-            if (!_sharedWatches.TryGetValue(source, out shared!))
-            {
-                shared = new SharedWatch(this, source);
-                _sharedWatches[source] = shared;
-            }
-
-            shared.AddSubscriber(onChange);
-        }
-
-        try
-        {
-            await shared.EnsureStartedAsync().ConfigureAwait(false);
-        }
-        catch
-        {
-            lock (_sync)
-            {
-                if (shared.RemoveSubscriber(onChange) == 0
-                    && _sharedWatches.TryGetValue(source, out var current)
-                    && ReferenceEquals(current, shared))
-                {
-                    _sharedWatches.Remove(source);
-                    shared.DisposeCore();
-                }
-            }
-
-            throw;
-        }
-
-        return new SharedSubscriptionHandle(this, source, shared, onChange, cancellationToken);
-    }
-
-    private async Task PumpAsync(
-        string source,
-        string resolved,
-        Func<ChangeEvent, Task> onChange,
-        long lastSeq,
-        Action<long>? onSynced,
-        CancellationToken cancellationToken)
-    {
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using (var listen = connection.CreateCommand())
-        {
-            listen.CommandText = "LISTEN pulse_changes";
-            await listen.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        while (true)
-        {
-            var changes = await FetchChangesAsync(connection, source, resolved, lastSeq, cancellationToken)
-                .ConfigureAwait(false);
-            foreach (var (seq, change) in changes)
-            {
-                await onChange(change).ConfigureAwait(false);
-                lastSeq = seq;
-            }
-
-            onSynced?.Invoke(lastSeq);
-            await WaitForSignalAsync(connection, cancellationToken).ConfigureAwait(false);
-        }
-    }
-
-    /// <summary>
-    /// Waits for a NOTIFY or the poll interval, whichever comes first. The poll fallback
-    /// makes delivery robust to a missed notification (e.g. one delivered while nobody was
-    /// LISTENing); the fetch step runs on every iteration, so nothing is lost.
-    /// </summary>
-    private async Task WaitForSignalAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
-    {
-        try
-        {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(_pollInterval);
-            await connection.WaitAsync(timeout.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (NpgsqlException)
-        {
-        }
-    }
+    private void ValidateProviderId(string source, ResumeToken resumeFrom) => resumeFrom.EnsureProvider(ProviderIdFor(source));
 
     private static string ResolvedSource(string source)
     {
@@ -581,418 +464,4 @@ public sealed class PostgresChangeSource : IChangeSource
         return BitConverter.ToInt64(opaque, 0);
     }
 
-    /// <summary>
-    /// Records a watcher start position for a source and ensures the pruning job is
-    /// running. The pruning floor for a source is the minimum position across its active
-    /// watchers; anything below it has been consumed (or superseded by a snapshot) and can
-    /// be deleted.
-    /// </summary>
-    private void AddPosition(string resolved, long watcherId, long seq)
-    {
-        lock (_sync)
-        {
-            if (!_positions.TryGetValue(resolved, out var floors) || floors is null)
-            {
-                floors = new Dictionary<long, long>();
-                _positions[resolved] = floors;
-            }
-
-            floors[watcherId] = seq;
-            if (_pruneTask is null)
-            {
-                var cts = new CancellationTokenSource();
-                _pruneCts = cts;
-                _pruneTask = PruneLoopAsync(cts);
-            }
-        }
-    }
-
-    private void RemovePosition(string resolved, long watcherId)
-    {
-        lock (_sync)
-        {
-            if (_positions.TryGetValue(resolved, out var floors) && floors is not null)
-            {
-                floors.Remove(watcherId);
-                if (floors.Count == 0)
-                {
-                    _positions.Remove(resolved);
-                }
-            }
-
-            if (_positions.Count == 0)
-            {
-                StopPrune();
-            }
-        }
-    }
-
-    /// <summary>
-    /// Raises a watcher's pruning floor as it consumes the log (e.g. a shared watch
-    /// advancing past delivered rows). Watchers are keyed by a unique id (not their floor),
-    /// so two watchers at the same sequence are never conflated. A no-op if the watcher is
-    /// no longer registered, so a stale sync arriving after the watch was torn down cannot
-    /// leak a floor.
-    /// </summary>
-    private void UpdatePosition(string resolved, long watcherId, long seq)
-    {
-        lock (_sync)
-        {
-            if (_positions.TryGetValue(resolved, out var floors) && floors is not null && floors.ContainsKey(watcherId))
-            {
-                floors[watcherId] = seq;
-            }
-        }
-    }
-
-    private long NextWatcherId() => Interlocked.Increment(ref _nextWatcherId);
-
-    private void StopPrune()
-    {
-        var cts = _pruneCts;
-        _pruneCts = null;
-        _pruneTask = null;
-        cts?.Cancel();
-    }
-
-    private async Task PruneLoopAsync(CancellationTokenSource cts)
-    {
-        var token = cts.Token;
-        try
-        {
-            while (!token.IsCancellationRequested)
-            {
-                try
-                {
-                    await Task.Delay(_pruneInterval, token).ConfigureAwait(false);
-                    await PruneOnceAsync(token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Change-log pruning failed; retrying at the next interval.");
-                }
-            }
-        }
-        finally
-        {
-            lock (_sync)
-            {
-                if (ReferenceEquals(_pruneCts, cts))
-                {
-                    _pruneCts = null;
-                    _pruneTask = null;
-                }
-            }
-
-            cts.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// Deletes rows below each source's pruning floor. Sources with no live watcher have
-    /// no floor and are skipped, so a resume token persisted across a restart (before any
-    /// watcher reconnects) is never truncated out from under it.
-    /// </summary>
-    private async Task PruneOnceAsync(CancellationToken token)
-    {
-        Dictionary<string, long> floors;
-        lock (_sync)
-        {
-            floors = new Dictionary<string, long>(StringComparer.Ordinal);
-            foreach (var (source, watchers) in _positions)
-            {
-                var min = long.MaxValue;
-                foreach (var floor in watchers.Values)
-                {
-                    if (floor < min)
-                    {
-                        min = floor;
-                    }
-                }
-
-                if (min != long.MaxValue)
-                {
-                    floors[source] = min;
-                }
-            }
-        }
-
-        if (floors.Count == 0)
-        {
-            return;
-        }
-
-        await using var connection = await _dataSource.OpenConnectionAsync(token).ConfigureAwait(false);
-        foreach (var (source, floor) in floors)
-        {
-            await using var command = connection.CreateCommand();
-            command.CommandText = "DELETE FROM pulse._changes WHERE source = @source AND seq < @floor";
-            command.Parameters.Add(new NpgsqlParameter("source", source));
-            command.Parameters.Add(new NpgsqlParameter("floor", floor));
-            await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
-        }
-    }
-
-    /// <summary>A shared per-source watcher that fans out to multiple subscribers.</summary>
-    private sealed class SharedWatch
-    {
-        private readonly PostgresChangeSource _owner;
-        private readonly string _source;
-        private readonly string _resolved;
-        private readonly List<Func<ChangeEvent, Task>> _subscribers = new();
-        private readonly ILogger _logger;
-        private readonly TimeSpan _pollInterval;
-        private CancellationTokenSource? _cts;
-        private Task? _startTask;
-        private readonly long _watcherId;
-        private long _lastSeq;
-        private int _consecutiveFailures;
-
-        public SharedWatch(PostgresChangeSource owner, string source)
-        {
-            _owner = owner;
-            _source = source;
-            _resolved = ResolvedSource(source);
-            _logger = owner._logger;
-            _pollInterval = owner._pollInterval;
-            _watcherId = owner.NextWatcherId();
-        }
-
-        public void AddSubscriber(Func<ChangeEvent, Task> onChange) => _subscribers.Add(onChange);
-
-        public int RemoveSubscriber(Func<ChangeEvent, Task> onChange)
-            => _subscribers.RemoveAll(s => ReferenceEquals(s, onChange));
-
-        /// <summary>Returns a task that completes when the underlying poller is started (or start failed).</summary>
-        public Task EnsureStartedAsync()
-        {
-            lock (_owner._sync)
-            {
-                if (_startTask is null)
-                {
-                    _cts = new CancellationTokenSource();
-                    _startTask = StartCoreAsync(_cts);
-                }
-
-                return _startTask;
-            }
-        }
-
-        private async Task StartCoreAsync(CancellationTokenSource cts)
-        {
-            try
-            {
-                _lastSeq = await _owner.GetCurrentMaxSeqAsync(_resolved, cts.Token).ConfigureAwait(false);
-                _owner.AddPosition(_resolved, _watcherId, _lastSeq);
-                _ = Task.Run(() => RunSupervisedAsync(cts));
-            }
-            catch (Exception)
-            {
-                lock (_owner._sync)
-                {
-                    _startTask = null;
-                }
-
-                throw;
-            }
-        }
-
-        /// <summary>
-        /// Runs the poller and restarts it after a failure with capped exponential backoff,
-        /// resuming from the last successfully delivered sequence so transient outages (a
-        /// dropped connection, missed NOTIFY) don't permanently kill the watch.
-        /// </summary>
-        private async Task RunSupervisedAsync(CancellationTokenSource cts)
-        {
-            while (!cts.IsCancellationRequested)
-            {
-                try
-                {
-                    await _owner.PumpAsync(_source, _resolved, FanOutAsync, _lastSeq, OnSynced, cts.Token)
-                        .ConfigureAwait(false);
-                    return;
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    var delay = BackoffDelay(_consecutiveFailures++);
-                    _logger.LogError(
-                        ex,
-                        "Change watch for source '{Source}' failed; retrying in {Delay} ms.",
-                        _source,
-                        (int)delay.TotalMilliseconds);
-                    try
-                    {
-                        await Task.Delay(delay, cts.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-
-        private void OnSynced(long seq)
-        {
-            _consecutiveFailures = 0;
-            lock (_owner._sync)
-            {
-                _lastSeq = seq;
-                _owner.UpdatePosition(_resolved, _watcherId, seq);
-            }
-        }
-
-        private TimeSpan BackoffDelay(int failures)
-        {
-            var capped = Math.Min(failures, 6);
-            var ms = _pollInterval.TotalMilliseconds * Math.Pow(2, capped);
-            return TimeSpan.FromMilliseconds(Math.Min(ms, 30000));
-        }
-
-        private async Task FanOutAsync(ChangeEvent change)
-        {
-            Func<ChangeEvent, Task>[] subscribers;
-            lock (_owner._sync)
-            {
-                subscribers = _subscribers.ToArray();
-            }
-
-            foreach (var subscriber in subscribers)
-            {
-                try
-                {
-                    await subscriber(change).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _owner._logger.LogError(ex, "Subscriber callback failed for source '{Source}'.", _source);
-                }
-            }
-        }
-
-        public void DisposeCore()
-        {
-            var cts = _cts;
-            if (cts is null)
-            {
-                return;
-            }
-
-            _cts = null;
-            _owner.RemovePosition(_resolved, _watcherId);
-            cts.Cancel();
-            cts.Dispose();
-        }
-    }
-
-    private sealed class SharedSubscriptionHandle : IAsyncDisposable
-    {
-        private readonly PostgresChangeSource _owner;
-        private readonly string _source;
-        private readonly SharedWatch _shared;
-        private readonly Func<ChangeEvent, Task> _onChange;
-        private readonly CancellationTokenRegistration _registration;
-        private bool _disposed;
-
-        public SharedSubscriptionHandle(
-            PostgresChangeSource owner,
-            string source,
-            SharedWatch shared,
-            Func<ChangeEvent, Task> onChange,
-            CancellationToken cancellationToken)
-        {
-            _owner = owner;
-            _source = source;
-            _shared = shared;
-            _onChange = onChange;
-            _registration = cancellationToken.Register(UnsubscribeSync);
-        }
-
-        private void UnsubscribeSync()
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
-            _registration.Unregister();
-            lock (_owner._sync)
-            {
-                if (_shared.RemoveSubscriber(_onChange) == 0
-                    && _owner._sharedWatches.TryGetValue(_source, out var current)
-                    && ReferenceEquals(current, _shared))
-                {
-                    _owner._sharedWatches.Remove(_source);
-                    _shared.DisposeCore();
-                }
-            }
-        }
-
-        public ValueTask DisposeAsync()
-        {
-            UnsubscribeSync();
-            return ValueTask.CompletedTask;
-        }
-    }
-
-    private sealed class PrivateWatchHandle : IAsyncDisposable
-    {
-        private readonly PostgresChangeSource _owner;
-        private readonly string _resolved;
-        private readonly long _watcherId;
-        private readonly CancellationTokenSource _cts;
-        private readonly Task _loop;
-        private bool _disposed;
-
-        public PrivateWatchHandle(
-            PostgresChangeSource owner,
-            string resolved,
-            long watcherId,
-            CancellationTokenSource cts,
-            Task loop)
-        {
-            _owner = owner;
-            _resolved = resolved;
-            _watcherId = watcherId;
-            _cts = cts;
-            _loop = loop;
-        }
-
-        /// <summary>Faults with <see cref="ResumeTokenInvalidException"/> if the token is lost while watching.</summary>
-        public Task Completion => _loop;
-
-        public async ValueTask DisposeAsync()
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
-            _owner.RemovePosition(_resolved, _watcherId);
-            _cts.Cancel();
-            try
-            {
-                await _loop.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (ResumeTokenInvalidException)
-            {
-                // Surfaced via Completion; disposal is not the place to rethrow.
-            }
-
-            _cts.Dispose();
-        }
-    }
 }

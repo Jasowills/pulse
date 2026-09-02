@@ -16,7 +16,7 @@ namespace Pulse.Client;
 /// </summary>
 public sealed class PulseClient : IAsyncDisposable
 {
-    private readonly HubConnection _connection;
+    private readonly IPulseTransport _transport;
     private readonly object _sync = new();
     private readonly Dictionary<string, IPulseSubscriptionHost> _subscriptions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<object>> _pending = new(StringComparer.Ordinal);
@@ -26,7 +26,7 @@ public sealed class PulseClient : IAsyncDisposable
     public JsonSerializerOptions JsonOptions => _json;
 
     /// <summary>Current connection state (useful for surfacing reconnect status to the UI).</summary>
-    public HubConnectionState State => _connection.State;
+    public HubConnectionState State => _transport.State;
 
     /// <summary>Raised when the connection has fully closed (final failure or manual stop).</summary>
     public event Func<Exception?, Task>? OnDisconnected;
@@ -41,9 +41,24 @@ public sealed class PulseClient : IAsyncDisposable
         string hubUrl,
         Action<HttpConnectionOptions>? configureHttpConnection = null,
         Action<JsonHubProtocolOptions>? configureJson = null)
+        : this(CreateDefaultTransport(hubUrl, configureHttpConnection, configureJson))
     {
-        _json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+    }
 
+    public PulseClient(IPulseTransport transport)
+    {
+        _transport = transport ?? throw new ArgumentNullException(nameof(transport));
+        _json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        _transport.OnSnapshot(m => { Dispatch(m); return Task.CompletedTask; });
+        _transport.OnChange(m => { Dispatch(m); return Task.CompletedTask; });
+        _transport.Closed += OnClosedAsync;
+        _transport.Reconnecting += OnReconnectingAsync;
+        _transport.Reconnected += OnReconnectedAsync;
+    }
+
+    private static IPulseTransport CreateDefaultTransport(string hubUrl, Action<HttpConnectionOptions>? configureHttpConnection, Action<JsonHubProtocolOptions>? configureJson)
+    {
+        var json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
         var builder = new HubConnectionBuilder()
             .WithUrl(hubUrl, configureHttpConnection ?? (_ => { }))
             .WithAutomaticReconnect()
@@ -52,19 +67,13 @@ public sealed class PulseClient : IAsyncDisposable
                 options.PayloadSerializerOptions.Converters.Add(new ObjectToInferredTypesConverter());
                 configureJson?.Invoke(options);
             });
-
-        _connection = builder.Build();
-        _connection.On<PulseSnapshotMessage>("PulseSnapshot", Dispatch);
-        _connection.On<PulseChangeMessage>("PulseChange", Dispatch);
-        _connection.Closed += OnClosedAsync;
-        _connection.Reconnecting += OnReconnectingAsync;
-        _connection.Reconnected += OnReconnectedAsync;
+        return new HubConnectionTransport(builder.Build());
     }
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        await _connection.StartAsync(cancellationToken).ConfigureAwait(false);
+        await _transport.StartAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -77,15 +86,13 @@ public sealed class PulseClient : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        if (_connection.State != HubConnectionState.Connected)
+        if (_transport.State != HubConnectionState.Connected)
         {
             throw new InvalidOperationException("PulseClient is not connected. Call ConnectAsync first.");
         }
 
         var whereJson = where is null ? null : JsonSerializer.Serialize(where);
-        var subscriptionId = await _connection
-            .InvokeAsync<string>("Subscribe", source, whereJson, cancellationToken)
-            .ConfigureAwait(false);
+        var subscriptionId = await _transport.InvokeSubscribeAsync(source, whereJson, cancellationToken).ConfigureAwait(false);
 
         var subscription = new PulseSubscription<T>(subscriptionId, source, where, _json, id => UnsubscribeAsync(id));
         lock (_sync)
@@ -118,9 +125,9 @@ public sealed class PulseClient : IAsyncDisposable
             _pending.Remove(subscriptionId);
         }
 
-        if (_connection.State == HubConnectionState.Connected)
+        if (_transport.State == HubConnectionState.Connected)
         {
-            await _connection.InvokeAsync("Unsubscribe", subscriptionId, cancellationToken).ConfigureAwait(false);
+            await _transport.InvokeUnsubscribeAsync(subscriptionId, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -143,7 +150,7 @@ public sealed class PulseClient : IAsyncDisposable
             _pending.Clear();
         }
 
-        await _connection.DisposeAsync().ConfigureAwait(false);
+        await _transport.DisposeAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -227,9 +234,7 @@ public sealed class PulseClient : IAsyncDisposable
     private async Task ResubscribeAsync(IPulseSubscriptionHost subscription)
     {
         var whereJson = subscription.Where is null ? null : JsonSerializer.Serialize(subscription.Where);
-        var newId = await _connection
-            .InvokeAsync<string>("Subscribe", subscription.Source, whereJson)
-            .ConfigureAwait(false);
+        var newId = await _transport.InvokeSubscribeAsync(subscription.Source, whereJson, CancellationToken.None).ConfigureAwait(false);
 
         lock (_sync)
         {

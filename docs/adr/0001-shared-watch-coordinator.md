@@ -1,0 +1,7 @@
+# SharedWatch coordinator owns fanout, backoff, and handle lifecycle
+
+Pulse's three providers (Mongo/Postgres/SQL Server) each copy-pasted ~300 LOC of orchestration: `_sync + Dictionary<string,SharedWatch>`, `RegisterSharedAsync/OpenPrivateWatchAsync`, `SharedWatch` (Add/RemoveSubscriber, EnsureStartedAsync→StartCoreAsync, RunSupervisedAsync with capped exponential backoff, FanOutAsync, BackoffDelay), and `Shared/PrivateWatchHandle`. The same resilience fix landed twice (`71b687f` PG+SQL then `c8a803c` Mongo). We decided to deepen `Pulse.Server` with a compositional `SharedWatchCoordinator` that owns sync, backoff, fanout, and handle lifecycle; each provider becomes a thin `IChangeSourceAdapter` supplying `GetCurrentPositionAsync`, `FetchAsync` (batched), `WaitAsync`, and `Codec` (encode/decode/validate). Pruning floor stays provider-private behind `NotifyProgress`.
+
+We chose composition over abstract base (keeps `IChangeSource` as the test surface and tolerates different bootstrap needs), `Pulse.Server` over a new `Pulse.Core` package (no new package tax), batched fetch over streaming (matches PG/SQL and Mongo's batch cursor), and a strangler migration (Postgres first — hardest case — behind `EnableCoordinator` flag) so the deepening lands incrementally.
+
+Considered: abstract base `PollingChangeSourceBase<TPosition>`, new `Pulse.Core` project, `IAsyncEnumerable` streaming poll, big-bang cutover — each rejected for coupling, package overhead, or risk.

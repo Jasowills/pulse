@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Pulse.Abstractions;
 
@@ -30,7 +32,14 @@ public sealed class FileResumeTokenStore : IResumeTokenStore
         var path = PathFor(key);
         if (!File.Exists(path))
         {
-            return Task.FromResult<ResumeToken?>(null);
+            // Fallback to pre-hash path for existing installations
+            var oldPath = OldPathFor(key);
+            if (!File.Exists(oldPath))
+            {
+                return Task.FromResult<ResumeToken?>(null);
+            }
+
+            path = oldPath;
         }
 
         try
@@ -66,10 +75,19 @@ public sealed class FileResumeTokenStore : IResumeTokenStore
         ArgumentNullException.ThrowIfNull(key);
 
         File.Delete(PathFor(key));
+        File.Delete(OldPathFor(key));
         return Task.CompletedTask;
     }
 
     private string PathFor(string key)
+    {
+        var safe = new string(key.Select(static c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
+        // Append short hash to avoid collisions (e.g. "a:b" vs "a_b" both -> "a_b.json")
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..8];
+        return Path.Combine(_directory, $"{safe}_{hash}.json");
+    }
+
+    private string OldPathFor(string key)
     {
         var safe = new string(key.Select(static c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
         return Path.Combine(_directory, safe + ".json");

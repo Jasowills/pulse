@@ -317,63 +317,8 @@ public class SubscriptionRegistry
         }
     }
 
-    /// <summary>
-    /// Decides what a subscription sees for a change, handling match transitions. Deletes
-    /// are always delivered (their FullDocument is null, so they can't be evaluated).
-    /// For filtered subscriptions an update that flips a document out of the filter becomes
-    /// a synthetic delete (so live lists drop the row) and one that flips it in becomes an
-    /// insert (so it appears even though the subscriber never saw the original insert).
-    /// Requires the registry lock; mutates <see cref="Subscription.TrackedIds"/>.
-    /// </summary>
     private ChangeEvent? DecideDelivery(ChangeEvent change, Subscription subscription)
-    {
-        if (subscription.Where is null)
-        {
-            return change;
-        }
-
-        switch (change.Kind)
-        {
-            case ChangeKind.Delete:
-                subscription.TrackedIds.Remove(change.DocumentId);
-                return change;
-
-            case ChangeKind.Insert:
-                if (change.FullDocument is null
-                    || _matcher.Matches(change.FullDocument, new SubscriptionFilter(change.Source, subscription.Where)))
-                {
-                    subscription.TrackedIds.Add(change.DocumentId);
-                    return change;
-                }
-
-                return null;
-
-            case ChangeKind.Update:
-            case ChangeKind.Replace:
-                if (change.FullDocument is null)
-                {
-                    // No post-image to evaluate; deliver as-is without touching the tracked set.
-                    return change;
-                }
-
-                if (_matcher.Matches(change.FullDocument, new SubscriptionFilter(change.Source, subscription.Where)))
-                {
-                    // Didn't match → now matches: surface as an insert so the subscriber
-                    // learns about the document even though it missed the original insert.
-                    return subscription.TrackedIds.Add(change.DocumentId)
-                        ? change with { Kind = ChangeKind.Insert }
-                        : change;
-                }
-
-                // Matched → no longer matches: synthetic delete so live lists drop the row.
-                return subscription.TrackedIds.Remove(change.DocumentId)
-                    ? change with { Kind = ChangeKind.Delete, FullDocument = null }
-                    : null;
-
-            default:
-                return change;
-        }
-    }
+        => MatchTransition.DecideDelivery(change, subscription.Where, subscription.TrackedIds, _matcher, change.Source);
 
     private readonly record struct QueuedChange(long Sequence, ChangeEvent Change);
 

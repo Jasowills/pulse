@@ -6,6 +6,7 @@ using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Pulse.Abstractions;
+using Pulse.Server;
 
 namespace Pulse.SqlServer;
 
@@ -20,18 +21,19 @@ namespace Pulse.SqlServer;
 /// fanned out internally; a watch resumed from an arbitrary point is private, since a
 /// resumed poller cannot be shared.
 /// </summary>
-public sealed class SqlServerChangeSource : IChangeSource
+public sealed class SqlServerChangeSource : IChangeSource, IChangePollAdapter
 {
     private readonly string _connectionString;
     private readonly string _databaseName;
     private readonly ILogger _logger;
     private readonly TimeSpan _pollInterval;
     private readonly object _sync = new();
-    private readonly Dictionary<string, SharedWatch> _sharedWatches = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _pkColumns = new(StringComparer.Ordinal);
     private readonly Dictionary<string, IReadOnlyList<ColumnInfo>> _columns = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HashSet<string>> _maskCache = new(StringComparer.Ordinal);
     private int _dbBootstrapped;
+
+    private readonly SharedWatchCoordinator _coordinator;
 
     public SqlServerChangeSource(
         string connectionString,
@@ -47,6 +49,7 @@ public sealed class SqlServerChangeSource : IChangeSource
         _databaseName = ParseDatabaseName(connectionString);
         _logger = logger ?? NullLogger<SqlServerChangeSource>.Instance;
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(250);
+        _coordinator = new SharedWatchCoordinator(this, new SharedWatchCoordinatorOptions { PollInterval = _pollInterval });
     }
 
     public string ProviderIdFor(string source)
@@ -73,14 +76,52 @@ public sealed class SqlServerChangeSource : IChangeSource
 
         await EnsureSourceAsync(source, cancellationToken).ConfigureAwait(false);
 
+        var resolved = ResolvedSourceFor(source);
         if (resumeFrom is not null)
         {
             ValidateProviderId(source, resumeFrom);
-            return await OpenPrivateWatchAsync(source, onChange, resumeFrom, cancellationToken).ConfigureAwait(false);
+            return await _coordinator.SubscribeResumedAsync(resolved, resumeFrom, onChange, cancellationToken).ConfigureAwait(false);
         }
 
-        return await RegisterSharedAsync(source, onChange, cancellationToken).ConfigureAwait(false);
+        return await _coordinator.SubscribeAsync(resolved, onChange, cancellationToken).ConfigureAwait(false);
     }
+
+    private static string ResolvedSourceFor(string source)
+    {
+        var (schema, table) = ResolveSource(source);
+        return $"{schema}.{table}";
+    }
+
+    // IChangePollAdapter
+    public async Task<ResumeToken> GetCurrentPositionAsync(string resolvedSource, CancellationToken cancellationToken)
+    {
+        var version = await GetCurrentVersionAsync(cancellationToken).ConfigureAwait(false);
+        return new ResumeToken(ProviderIdFor(resolvedSource), EncodeVersion(version));
+    }
+
+    public async Task<PollBatch> PollAsync(string resolvedSource, ResumeToken after, CancellationToken cancellationToken)
+    {
+        var afterVersion = DecodeVersion(after.Opaque);
+        var current = await GetCurrentVersionAsync(cancellationToken).ConfigureAwait(false);
+        if (afterVersion > current)
+        {
+            throw new ResumeTokenInvalidException(
+                $"Resume token for '{ProviderIdFor(resolvedSource)}' points past the current version (version {afterVersion} > current {current}).");
+        }
+
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var changes = await FetchChangesAsync(connection, resolvedSource, resolvedSource, afterVersion, cancellationToken).ConfigureAwait(false);
+        if (changes.Count == 0)
+        {
+            return new PollBatch(Array.Empty<ChangeEvent>(), after);
+        }
+
+        var events = changes.Select(c => c.Change).ToList();
+        return new PollBatch(events, events[^1].Token);
+    }
+
+    public Task WaitAsync(string resolvedSource, CancellationToken cancellationToken)
+        => Task.Delay(_pollInterval, cancellationToken);
 
     public async Task<(IReadOnlyList<IReadOnlyDictionary<string, object?>> Documents, ResumeToken AsOf)>
         GetSnapshotAsync(string source, SubscriptionFilter filter, CancellationToken cancellationToken)
@@ -478,41 +519,8 @@ public sealed class SqlServerChangeSource : IChangeSource
         return names;
     }
 
-    private void ValidateProviderId(string source, ResumeToken resumeFrom)
-    {
-        var expected = ProviderIdFor(source);
-        if (!string.Equals(resumeFrom.ProviderId, expected, StringComparison.Ordinal))
-        {
-            throw new ResumeTokenInvalidException(
-                $"Resume token was issued by '{resumeFrom.ProviderId}', but watching '{expected}'. Refusing to misinterpret the token.");
-        }
-    }
+    private void ValidateProviderId(string source, ResumeToken resumeFrom) => resumeFrom.EnsureProvider(ProviderIdFor(source));
 
-    private async Task<IAsyncDisposable> OpenPrivateWatchAsync(
-        string source,
-        Func<ChangeEvent, Task> onChange,
-        ResumeToken resumeFrom,
-        CancellationToken cancellationToken)
-    {
-        var resolved = ResolvedSource(source);
-        var version = DecodeVersion(resumeFrom.Opaque);
-
-        var current = await GetCurrentVersionAsync(cancellationToken).ConfigureAwait(false);
-        if (version > current)
-        {
-            throw new ResumeTokenInvalidException(
-                $"Resume token for '{ProviderIdFor(source)}' points past the current change-tracking version ({version} > {current}). The token is stale or was issued against a different database; refusing to resume from it.");
-        }
-
-        // Run one CHANGETABLE probe so a token older than the retention window fails here
-        // (as ResumeTokenInvalidException, caught by the registry for a fresh resync) instead
-        // of failing later inside the pump.
-        await ValidateVersionUsableAsync(source, resolved, version, cancellationToken).ConfigureAwait(false);
-
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var loop = PumpAsync(source, resolved, onChange, version, onSynced: null, cts.Token);
-        return new PrivateWatchHandle(cts, loop);
-    }
 
     private async Task ValidateVersionUsableAsync(
         string source,
@@ -545,75 +553,7 @@ public sealed class SqlServerChangeSource : IChangeSource
     }
 
     /// <summary>Registers a callback on a shared per-source watcher, creating it on first use.</summary>
-    private async Task<IAsyncDisposable> RegisterSharedAsync(
-        string source,
-        Func<ChangeEvent, Task> onChange,
-        CancellationToken cancellationToken)
-    {
-        SharedWatch shared;
-        lock (_sync)
-        {
-            if (!_sharedWatches.TryGetValue(source, out shared!))
-            {
-                shared = new SharedWatch(this, source);
-                _sharedWatches[source] = shared;
-            }
 
-            shared.AddSubscriber(onChange);
-        }
-
-        try
-        {
-            await shared.EnsureStartedAsync().ConfigureAwait(false);
-        }
-        catch
-        {
-            lock (_sync)
-            {
-                if (shared.RemoveSubscriber(onChange) == 0
-                    && _sharedWatches.TryGetValue(source, out var current)
-                    && ReferenceEquals(current, shared))
-                {
-                    _sharedWatches.Remove(source);
-                    shared.DisposeCore();
-                }
-            }
-
-            throw;
-        }
-
-        return new SharedSubscriptionHandle(this, source, shared, onChange, cancellationToken);
-    }
-
-    private async Task PumpAsync(
-        string source,
-        string resolved,
-        Func<ChangeEvent, Task> onChange,
-        long lastSynced,
-        Action<long>? onSynced,
-        CancellationToken cancellationToken)
-    {
-        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-
-        while (true)
-        {
-            var changes = await FetchChangesAsync(connection, source, resolved, lastSynced, cancellationToken)
-                .ConfigureAwait(false);
-            long max = lastSynced;
-            foreach (var (version, change) in changes)
-            {
-                await onChange(change).ConfigureAwait(false);
-                if (version > max)
-                {
-                    max = version;
-                }
-            }
-
-            lastSynced = max;
-            onSynced?.Invoke(lastSynced);
-            await Task.Delay(_pollInterval, cancellationToken).ConfigureAwait(false);
-        }
-    }
 
     private async Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
@@ -737,260 +677,12 @@ public sealed class SqlServerChangeSource : IChangeSource
     private static string QuoteIdent(string name)
         => "[" + name.Replace("]", "]]", StringComparison.Ordinal) + "]";
 
-    private static byte[] EncodeVersion(long version) => BitConverter.GetBytes(version);
-
-    private static long DecodeVersion(byte[] opaque)
-    {
-        if (opaque is null || opaque.Length != sizeof(long))
-        {
-            throw new ResumeTokenInvalidException(
-                "SQL Server resume tokens must be 8 bytes (a change-tracking version).");
-        }
-
-        return BitConverter.ToInt64(opaque, 0);
-    }
+    private static byte[] EncodeVersion(long version) => Int64ResumeTokenCodec.Encode(version);
+    private static long DecodeVersion(byte[] opaque) => Int64ResumeTokenCodec.Decode(opaque);
 
     private sealed record ColumnInfo(string Name, bool IsStringType);
 
     /// <summary>A shared per-source watcher that fans out to multiple subscribers.</summary>
-    private sealed class SharedWatch
-    {
-        private readonly SqlServerChangeSource _owner;
-        private readonly string _source;
-        private readonly string _resolved;
-        private readonly List<Func<ChangeEvent, Task>> _subscribers = new();
-        private readonly ILogger _logger;
-        private readonly TimeSpan _pollInterval;
-        private CancellationTokenSource? _cts;
-        private Task? _startTask;
-        private long _lastSynced;
-        private int _consecutiveFailures;
 
-        public SharedWatch(SqlServerChangeSource owner, string source)
-        {
-            _owner = owner;
-            _source = source;
-            _resolved = ResolvedSource(source);
-            _logger = owner._logger;
-            _pollInterval = owner._pollInterval;
-        }
 
-        public void AddSubscriber(Func<ChangeEvent, Task> onChange) => _subscribers.Add(onChange);
-
-        public int RemoveSubscriber(Func<ChangeEvent, Task> onChange)
-            => _subscribers.RemoveAll(s => ReferenceEquals(s, onChange));
-
-        /// <summary>Returns a task that completes when the underlying poller is started (or start failed).</summary>
-        public Task EnsureStartedAsync()
-        {
-            lock (_owner._sync)
-            {
-                if (_startTask is null)
-                {
-                    _cts = new CancellationTokenSource();
-                    _startTask = StartCoreAsync(_cts);
-                }
-
-                return _startTask;
-            }
-        }
-
-        private async Task StartCoreAsync(CancellationTokenSource cts)
-        {
-            try
-            {
-                _lastSynced = await _owner.GetCurrentVersionAsync(cts.Token).ConfigureAwait(false);
-                _ = Task.Run(() => RunSupervisedAsync(cts));
-            }
-            catch (Exception)
-            {
-                lock (_owner._sync)
-                {
-                    _startTask = null;
-                }
-
-                throw;
-            }
-        }
-
-        /// <summary>
-        /// Runs the poller and restarts it after a failure with capped exponential backoff,
-        /// resuming from the last successfully delivered version so transient outages (a
-        /// dropped connection, change-tracking cleanup) don't permanently kill the watch.
-        /// </summary>
-        private async Task RunSupervisedAsync(CancellationTokenSource cts)
-        {
-            while (!cts.IsCancellationRequested)
-            {
-                try
-                {
-                    await _owner.PumpAsync(_source, _resolved, FanOutAsync, _lastSynced, OnSynced, cts.Token)
-                        .ConfigureAwait(false);
-                    return;
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    var delay = BackoffDelay(_consecutiveFailures++);
-                    _logger.LogError(
-                        ex,
-                        "Change watch for source '{Source}' failed; retrying in {Delay} ms.",
-                        _source,
-                        (int)delay.TotalMilliseconds);
-                    try
-                    {
-                        await Task.Delay(delay, cts.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-
-        private void OnSynced(long version)
-        {
-            _consecutiveFailures = 0;
-            lock (_owner._sync)
-            {
-                _lastSynced = version;
-            }
-        }
-
-        private TimeSpan BackoffDelay(int failures)
-        {
-            var capped = Math.Min(failures, 6);
-            var ms = _pollInterval.TotalMilliseconds * Math.Pow(2, capped);
-            return TimeSpan.FromMilliseconds(Math.Min(ms, 30000));
-        }
-
-        private async Task FanOutAsync(ChangeEvent change)
-        {
-            Func<ChangeEvent, Task>[] subscribers;
-            lock (_owner._sync)
-            {
-                subscribers = _subscribers.ToArray();
-            }
-
-            foreach (var subscriber in subscribers)
-            {
-                try
-                {
-                    await subscriber(change).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _owner._logger.LogError(ex, "Subscriber callback failed for source '{Source}'.", _source);
-                }
-            }
-        }
-
-        public void DisposeCore()
-        {
-            var cts = _cts;
-            if (cts is null)
-            {
-                return;
-            }
-
-            _cts = null;
-            cts.Cancel();
-            cts.Dispose();
-        }
-    }
-
-    private sealed class SharedSubscriptionHandle : IAsyncDisposable
-    {
-        private readonly SqlServerChangeSource _owner;
-        private readonly string _source;
-        private readonly SharedWatch _shared;
-        private readonly Func<ChangeEvent, Task> _onChange;
-        private readonly CancellationTokenRegistration _registration;
-        private bool _disposed;
-
-        public SharedSubscriptionHandle(
-            SqlServerChangeSource owner,
-            string source,
-            SharedWatch shared,
-            Func<ChangeEvent, Task> onChange,
-            CancellationToken cancellationToken)
-        {
-            _owner = owner;
-            _source = source;
-            _shared = shared;
-            _onChange = onChange;
-            _registration = cancellationToken.Register(UnsubscribeSync);
-        }
-
-        private void UnsubscribeSync()
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
-            _registration.Unregister();
-            lock (_owner._sync)
-            {
-                if (_shared.RemoveSubscriber(_onChange) == 0
-                    && _owner._sharedWatches.TryGetValue(_source, out var current)
-                    && ReferenceEquals(current, _shared))
-                {
-                    _owner._sharedWatches.Remove(_source);
-                    _shared.DisposeCore();
-                }
-            }
-        }
-
-        public ValueTask DisposeAsync()
-        {
-            UnsubscribeSync();
-            return ValueTask.CompletedTask;
-        }
-    }
-
-    private sealed class PrivateWatchHandle : IAsyncDisposable
-    {
-        private readonly CancellationTokenSource _cts;
-        private readonly Task _loop;
-        private bool _disposed;
-
-        public PrivateWatchHandle(CancellationTokenSource cts, Task loop)
-        {
-            _cts = cts;
-            _loop = loop;
-        }
-
-        /// <summary>Faults with <see cref="ResumeTokenInvalidException"/> if the token is lost while watching.</summary>
-        public Task Completion => _loop;
-
-        public async ValueTask DisposeAsync()
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
-            _cts.Cancel();
-            try
-            {
-                await _loop.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (ResumeTokenInvalidException)
-            {
-                // Surfaced via Completion; disposal is not the place to rethrow.
-            }
-
-            _cts.Dispose();
-        }
-    }
 }

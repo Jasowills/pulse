@@ -46,20 +46,5 @@ public sealed class ObjectToInferredTypesConverter : JsonConverter<object>
     public override void Write(Utf8JsonWriter writer, object value, JsonSerializerOptions options)
         => JsonSerializer.Serialize(writer, value, value.GetType(), options);
 
-    private static object? ReadElement(JsonElement element)
-    {
-        return element.ValueKind switch
-        {
-            JsonValueKind.True => true,
-            JsonValueKind.False => false,
-            JsonValueKind.Number => element.TryGetInt64(out var integral)
-                ? integral
-                : (object?)element.GetDouble(),
-            JsonValueKind.String => element.GetString(),
-            JsonValueKind.Object => element.EnumerateObject()
-                .ToDictionary(p => p.Name, p => ReadElement(p.Value)),
-            JsonValueKind.Array => element.EnumerateArray().Select(ReadElement).ToList(),
-            _ => null,
-        };
-    }
+    private static object? ReadElement(JsonElement element) => ClrValueCoercer.ToClrValue(element);
 }

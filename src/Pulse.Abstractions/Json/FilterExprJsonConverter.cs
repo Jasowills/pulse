@@ -254,39 +254,13 @@ internal static class FilterExprJsonCore
 
 internal static class JsonValueNormalizer
 {
-    /// <summary>Converts a <see cref="JsonElement"/> to plain CLR values.</summary>
     public static object? ToClrValue(JsonElement element)
     {
-        switch (element.ValueKind)
+        if (element.ValueKind == JsonValueKind.Undefined)
         {
-            case JsonValueKind.Null:
-                return null;
-            case JsonValueKind.True:
-                return true;
-            case JsonValueKind.False:
-                return false;
-            case JsonValueKind.String:
-                return element.GetString();
-            case JsonValueKind.Number:
-                return element.TryGetInt64(out var integral) ? (object)integral : element.GetDouble();
-            case JsonValueKind.Array:
-                var list = new List<object?>();
-                foreach (var item in element.EnumerateArray())
-                {
-                    list.Add(ToClrValue(item));
-                }
-
-                return list;
-            case JsonValueKind.Object:
-                var dict = new Dictionary<string, object?>(StringComparer.Ordinal);
-                foreach (var property in element.EnumerateObject())
-                {
-                    dict[property.Name] = ToClrValue(property.Value);
-                }
-
-                return dict;
-            default:
-                throw new JsonException($"Unsupported JSON value kind '{element.ValueKind}'.");
+            throw new JsonException($"Unsupported JSON value kind '{element.ValueKind}'.");
         }
+
+        return ClrValueCoercer.ToClrValue(element);
     }
 }
