@@ -27,7 +27,9 @@ public static class ClrValueCoercer
         {
             JsonValueKind.Null => null,
             JsonValueKind.String => element.GetString(),
-            JsonValueKind.Number => element.TryGetInt64(out var integral) ? (object)integral : element.GetDouble(),
+            JsonValueKind.Number => element.TryGetInt64(out var i64) ? (object)i64
+                : element.TryGetUInt64(out var u64) ? (object)u64
+                : element.GetDouble(),
             JsonValueKind.True => true,
             JsonValueKind.False => false,
             JsonValueKind.Object => element.EnumerateObject()

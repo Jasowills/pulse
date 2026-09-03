@@ -179,10 +179,34 @@ public static class FilterValueHelpers
 
     private static int CompareNumeric(object a, object b)
     {
+        // NaN/Infinity must not be considered equal even when compared via double (preserve prior IEEE-like behavior).
+        if ((a is double da && (double.IsNaN(da) || double.IsInfinity(da)))
+            || (a is float fa && (float.IsNaN(fa) || float.IsInfinity(fa)))
+            || (b is double db && (double.IsNaN(db) || double.IsInfinity(db)))
+            || (b is float fb && (float.IsNaN(fb) || float.IsInfinity(fb))))
+        {
+            return -1;
+        }
+
+        // Try decimal first for exactness (covers Int64, UInt64, Decimal precisely).
+        // For values outside decimal range (e.g., double.MaxValue ~1.8e308 > 7.9e28) fallback to double.
         try
         {
             return Convert.ToDecimal(a, System.Globalization.CultureInfo.InvariantCulture)
                 .CompareTo(Convert.ToDecimal(b, System.Globalization.CultureInfo.InvariantCulture));
+        }
+        catch (OverflowException)
+        {
+            // Both outside decimal range — compare as double (preserves equality for same large magnitude).
+            try
+            {
+                return Convert.ToDouble(a, System.Globalization.CultureInfo.InvariantCulture)
+                    .CompareTo(Convert.ToDouble(b, System.Globalization.CultureInfo.InvariantCulture));
+            }
+            catch (Exception)
+            {
+                return -1;
+            }
         }
         catch (Exception)
         {

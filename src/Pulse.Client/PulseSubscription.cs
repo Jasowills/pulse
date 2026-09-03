@@ -142,6 +142,11 @@ internal sealed class PulseSubscription<T> : IPulseSubscription<T>, IPulseSubscr
             docs.Add(document);
             if (TryGetId(raw, out var id))
             {
+                if (byId.ContainsKey(id))
+                {
+                    System.Diagnostics.Debug.WriteLine($"Pulse snapshot for '{Id}' contains duplicate _id '{id}'; last wins.");
+                }
+
                 byId[id] = document;
             }
         }

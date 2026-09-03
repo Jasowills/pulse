@@ -17,7 +17,7 @@ public static class MongoFilterTranslator
     private sealed class Translator : FilterTranslatorBase<FilterDefinition<BsonDocument>>
     {
         protected override FilterDefinition<BsonDocument> EmptyAnd() => Builders<BsonDocument>.Filter.Empty;
-        protected override FilterDefinition<BsonDocument> EmptyOr() => Builders<BsonDocument>.Filter.Empty;
+        protected override FilterDefinition<BsonDocument> EmptyOr() => Builders<BsonDocument>.Filter.In("_id", Array.Empty<BsonValue>());
         protected override FilterDefinition<BsonDocument> CombineAnd(IEnumerable<FilterDefinition<BsonDocument>> c) => Builders<BsonDocument>.Filter.And(c.ToArray());
         protected override FilterDefinition<BsonDocument> CombineOr(IEnumerable<FilterDefinition<BsonDocument>> c) => Builders<BsonDocument>.Filter.Or(c.ToArray());
         protected override FilterDefinition<BsonDocument> Negate(FilterDefinition<BsonDocument> c) => Builders<BsonDocument>.Filter.Not(c);
@@ -25,6 +25,16 @@ public static class MongoFilterTranslator
         protected override FilterDefinition<BsonDocument> TranslateCompare(FieldCompare compare)
         {
             if (string.IsNullOrWhiteSpace(compare.Field)) throw new ArgumentException("Filter field must be a non-empty path.", nameof(compare));
+            // Guard against operator injection: field paths must not contain Mongo operators ($ prefix)
+            var segments = compare.Field.Split('.');
+            foreach (var seg in segments)
+            {
+                if (seg.Length > 0 && seg[0] == '$')
+                {
+                    throw new ArgumentException($"Filter field path segment '{seg}' must not start with '$' (operator injection).", nameof(compare));
+                }
+            }
+
             var field = compare.Field;
             var isId = field.Equals("_id", StringComparison.Ordinal);
             var value = isId ? NormalizeId(ToBsonValue(compare.Value)) : ToBsonValue(compare.Value);
@@ -55,7 +65,7 @@ public static class MongoFilterTranslator
                 case string s: return new BsonString(s);
                 case bool b: return new BsonBoolean(b);
                 case byte or sbyte or short or ushort or int or uint or long: return new BsonInt64(Convert.ToInt64(value));
-                case ulong ul: return new BsonInt64(checked((long)ul));
+                case ulong ul: return ul <= (ulong)long.MaxValue ? new BsonInt64((long)ul) : new BsonDecimal128(new Decimal128(ul));
                 case float or double: return new BsonDouble(Convert.ToDouble(value));
                 case decimal m: return new BsonDecimal128(m);
                 case DateTime dt: return new BsonDateTime(dt);
